@@ -92,6 +92,128 @@ def admin_only_allowed(update: Update):
     return is_admin(update.effective_user.id)
 
 
+
+# ===========================
+# GROUP AUTH HELPERS
+# ===========================
+
+async def group_admin_allowed(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Allow only Owner or Telegram group admins in authorized groups."""
+    chat = update.effective_chat
+    user = update.effective_user
+
+    if chat.type not in ("group", "supergroup"):
+        return False, "❌ Ye command group me use karo."
+
+    if is_owner(user.id):
+        return True, None
+
+    if not group_is_authorized(chat.id):
+        return False, "🔒 Ye group Owner ne authorize nahi kiya."
+
+    try:
+        member = await context.bot.get_chat_member(chat.id, user.id)
+    except Exception:
+        return False, "❌ Aapka group admin status check nahi ho paaya."
+
+    if member.status not in ("administrator", "creator"):
+        return False, "❌ Sirf group admin/Owner ye command use kar sakta hai."
+
+    return True, None
+
+
+async def group_control_allowed(update: Update):
+    """Basic gate for commands that work in groups."""
+    chat = update.effective_chat
+
+    if chat.type not in ("group", "supergroup"):
+        return True, None
+
+    if not group_is_authorized(chat.id):
+        return False, "🔒 Ye group Owner ne authorize nahi kiya."
+
+    return True, None
+
+
+async def add_close_allowed(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Gate /add and /close: Owner or Telegram group admin, authorized group only."""
+    chat = update.effective_chat
+    user = update.effective_user
+
+    if chat.type not in ("group", "supergroup"):
+        return True, None
+
+    if is_owner(user.id):
+        if not group_is_authorized(chat.id):
+            return False, "🔒 Ye group Owner ne authorize nahi kiya."
+        return True, None
+
+    if not group_is_authorized(chat.id):
+        return False, "🔒 Ye group Owner ne authorize nahi kiya."
+
+    try:
+        member = await context.bot.get_chat_member(chat.id, user.id)
+    except Exception:
+        return False, "❌ Aapka group admin status check nahi ho paaya."
+
+    if member.status not in ("administrator", "creator"):
+        return False, "❌ Sirf group admin/Owner /add aur /close use kar sakta hai."
+
+    return True, None
+
+
+def find_user_target(context: ContextTypes.DEFAULT_TYPE, update: Update):
+    """Resolve target for the existing status renderer."""
+    user = update.effective_user
+
+    if update.message and update.message.reply_to_message:
+        target = update.message.reply_to_message.from_user
+        if target:
+            username = (target.username or "").lstrip("@").lower()
+            return target.id, username, target.first_name or "User"
+
+    return user.id, (user.username or "").lstrip("@").lower(), user.first_name or "User"
+
+
+def status_for_target(user_id, username, first_name):
+    """Build stats for an explicit target without changing the normal /stats UI."""
+    username = (username or "").lstrip("@").lower()
+
+    # Existing deals store escrowed_by as a username.
+    mine = []
+    for d in DEALS.values():
+        escrowed_by = str(d.get("escrowed_by") or "").lstrip("@").lower()
+        if username and escrowed_by == username:
+            mine.append(d)
+
+    completed = [d for d in mine if d.get("status") == "COMPLETED"]
+    active = [d for d in mine if d.get("status") == "ACTIVE"]
+
+    totals = {"TON": 0.0, "USDT": 0.0, "INR": 0.0}
+    for d in completed:
+        cur = d.get("currency", "INR")
+        totals[cur] = totals.get(cur, 0.0) + float(d.get("amount", 0.0) or 0.0)
+
+    board = build_leaderboard(today_only=False)
+    rank_key = username or str(user_id)
+    rank = get_rank(rank_key, board, by="deals")
+
+    return (
+        f"{pe('📈')} <b>{esc(first_name)} Deal status !</b>\n"
+        "──────────────────\n"
+        f"{pe('🚀')} Rank ➤ #{rank}\n\n"
+        f"{pe('🔥')} Active deals ➤ {len(active)}\n\n"
+        f"{pe('✅')} Total Escrow's ➤ {len(completed)}\n\n"
+        f"{pe('⚡')} Total Volume :\n"
+        f"  {pe('🪙')} ➤ {totals.get('TON', 0.0):g} TON\n"
+        f"  {pe('💰')} ➤ {totals.get('USDT', 0.0):g} USDT\n"
+        f"  {pe('🤑')} ➤ {totals.get('INR', 0.0):g} ₹\n"
+        "──────────────────\n"
+        f"{pe('📱')} Escrow Bot for {BRAND}\n"
+        f"{pe('💤')} Provided by {PROVIDER} !"
+    )
+
+
 # ===========================
 # GROUP CONTROL / AUTHORIZATION
 # ===========================
@@ -670,48 +792,25 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ===========================
 
 async def _legacy_mystatus_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /stats
-      - Normal user: apna status.
-      - Authorized group: sirf group admin kisi bhi user ka status dekh sakta hai.
-      - Private: bot-admin kisi bhi user ka status dekh sakta hai.
-    """
     remember_user(update)
 
-    # Target diya hai / reply kiya hai to elevated permission required.
-    has_target = bool(context.args) or bool(
-        update.message and update.message.reply_to_message
-    )
-
-    if update.effective_chat.type in ("group", "supergroup"):
-        if has_target:
-            allowed, reason = await group_admin_allowed(update, context)
-            if not allowed:
-                if reason and update.message:
-                    await update.message.reply_text(reason)
-                return
-        else:
-            allowed, reason = await group_control_allowed(update)
-            if not allowed:
-                if reason and update.message:
-                    await update.message.reply_text(reason)
-                return
-    else:
-        if has_target and not is_admin(update.effective_user.id):
-            return
-
-    user_id, username, first_name = find_user_target(context, update)
-
-    # User ne username diya aur wo known record me nahi mila, tab bhi
-    # username-based historical deals ka status dikh sakta hai.
-    if not user_id and not username:
-        await update.message.reply_text("❌ User ID/username resolve nahi ho paaya.")
+    target = update.effective_user
+    if not target:
         return
 
-    if has_target:
-        text = status_for_target(user_id, username, first_name)
-    else:
+    # Proxy target is already resolved by mystatus_cmd.
+    username = (getattr(target, "username", None) or "").lstrip("@").lower()
+    first_name = getattr(target, "first_name", None) or "User"
+
+    # For the command sender, preserve the original UI exactly.
+    if not (update.message and update.message.reply_to_message):
         text = my_status_text(update)
+    else:
+        text = status_for_target(
+            getattr(target, "id", None),
+            username,
+            first_name,
+        )
 
     await update.message.reply_text(
         text,
