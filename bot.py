@@ -4,7 +4,8 @@ import time
 import html
 import asyncio
 import threading
-from datetime import datetime, timezone
+import logging
+from datetime import datetime, timezone, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from dotenv import load_dotenv
@@ -22,6 +23,47 @@ from telegram.ext import (
 )
 
 load_dotenv()
+
+
+# ===========================
+# TERMINAL LOGGING
+# ===========================
+class CompactFormatter(logging.Formatter):
+    def format(self, record):
+        return super().format(record)
+
+
+def setup_logging():
+    """Readable production-friendly terminal logs; avoids noisy library logs."""
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+
+    # Prevent duplicate handlers when reloaded by a process manager.
+    for handler in list(root.handlers):
+        root.removeHandler(handler)
+
+    handler = logging.StreamHandler()
+    handler.setFormatter(
+        CompactFormatter(
+            "[%(asctime)s] %(levelname)-8s | %(message)s",
+            datefmt="%H:%M:%S",
+        )
+    )
+    root.addHandler(handler)
+
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.getLogger("telegram").setLevel(logging.WARNING)
+    logging.getLogger("apscheduler").setLevel(logging.WARNING)
+
+
+setup_logging()
+logger = logging.getLogger("rizzlerxescrow")
+
+
+def log_event(scope, message, level=logging.INFO, *args):
+    logger.log(level, "[%-8s] " + message, scope, *args)
+
 
 # ===========================
 # Config (.env se aata hai)
@@ -62,14 +104,16 @@ if coll is not None:
     for doc in coll.find({}):
         tid = doc.pop("_id")
         DEALS[tid] = doc
-    print(f"✅ [rizzlerxescrow] {len(DEALS)} deal(s) Mongo se load hui")
+    log_event("MONGO", "%d deal(s) loaded")
+
 
 # ---- Bot-admin set (owners + dynamically added admins) ----
 BOT_ADMINS = set(OWNER_IDS)
 if admins_coll is not None:
     for doc in admins_coll.find({}):
         BOT_ADMINS.add(doc["_id"])
-    print(f"✅ [rizzlerxescrow] {len(BOT_ADMINS)} bot admin(s) load hue")
+    log_event("AUTH", "%d bot admin(s) loaded")
+
 
 
 def save_deal(tid):
@@ -778,6 +822,14 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         target = "global"
         text = global_status_text()
     else:
+        log_event(
+            "CALLBACK",
+            "Unhandled callback | user=%s | data=%s",
+            logging.WARNING,
+            update.effective_user.id if update.effective_user else "?",
+            data,
+        )
+        await query.answer("⚠️ This button is outdated. Please reopen the menu.", show_alert=True)
         return
 
     await query.edit_message_text(
@@ -1487,27 +1539,6 @@ GROUP_ACCESS = [
 ]
 
 
-async def get_bot_group_permissions(context, chat_id):
-    try:
-        me = await context.bot.get_me()
-        member = await context.bot.get_chat_member(chat_id, me.id)
-    except Exception as e:
-        return None, f"❌ Bot permissions check nahi ho paaya: {e}"
-
-    if member.status not in ("administrator", "creator"):
-        return None, "❌ Bot is group me Admin nahi hai."
-
-    return {
-        "status": member.status,
-        "can_delete_messages": bool(getattr(member, "can_delete_messages", False)),
-        "can_restrict_members": bool(getattr(member, "can_restrict_members", False)),
-        "can_ban_members": bool(getattr(member, "can_ban_members", False)),
-        "can_invite_users": bool(getattr(member, "can_invite_users", False)),
-        "can_pin_messages": bool(getattr(member, "can_pin_messages", False)),
-        "can_manage_topics": bool(getattr(member, "can_manage_topics", False)),
-        "can_change_info": bool(getattr(member, "can_change_info", False)),
-        "can_manage_chat": bool(getattr(member, "can_manage_chat", False)),
-    }, None
 
 
 def group_access_panel_kb(group_id):
@@ -1518,134 +1549,12 @@ def group_access_panel_kb(group_id):
     ])
 
 
-def group_access_text(group, permissions):
-    title = esc(group.get("title", f"Group {group.get('_id')}"))
-    gid = group.get("_id")
-    lines = [
-        f"{pe('🛡')} <b>BOT ACCESS PANEL</b>",
-        "──────────────────",
-        f"<b>Group:</b> {title}",
-        f"<b>Group ID:</b> <code>{gid}</code>",
-        "",
-    ]
-    if not permissions:
-        lines.append("🔴 Bot permission data unavailable.")
-        return "\n".join(lines)
-
-    lines.append(f"<b>Bot Telegram Status:</b> <code>{esc(permissions.get('status', '-'))}</code>")
-    lines.append("")
-    for key, label in GROUP_ACCESS:
-        lines.append(f"{'🟢' if permissions.get(key, False) else '🔴'} {label}")
-    lines += [
-        "",
-        "──────────────────",
-        "🟢 = Permission available",
-        "🔴 = Permission missing",
-        "",
-        "<b>Owner-only panel.</b>",
-    ]
-    return "\n".join(lines)
 
 
-async def group_access_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type != "private" or not is_owner(update.effective_user.id):
-        return
-    if groups_coll is None:
-        await update.message.reply_text("❌ MongoDB required.")
-        return
-    if not context.args or not context.args[0].lstrip("-").isdigit():
-        await update.message.reply_text("Usage: /groupaccess <group_id>")
-        return
-    gid = int(context.args[0])
-    group = groups_coll.find_one({"_id": gid})
-    if not group:
-        await update.message.reply_text("❌ Group record nahi mila.")
-        return
-    permissions, error = await get_bot_group_permissions(context, gid)
-    if error:
-        await update.message.reply_text(error)
-        return
-    await update.message.reply_text(
-        group_access_text(group, permissions),
-        parse_mode=ParseMode.HTML,
-        reply_markup=group_access_panel_kb(gid),
-    )
 
 
-async def group_access_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    if not query.message or query.message.chat.type != "private" or not is_owner(query.from_user.id):
-        await query.answer("❌ Sirf Owner.", show_alert=True)
-        return
-    try:
-        gid = int(query.data.split(":", 1)[1])
-    except Exception:
-        await query.answer("Invalid group.", show_alert=True)
-        return
-    group = groups_coll.find_one({"_id": gid}) if groups_coll is not None else None
-    if not group:
-        await query.answer("Group record nahi mila.", show_alert=True)
-        return
-    permissions, error = await get_bot_group_permissions(context, gid)
-    if error:
-        await query.answer(error, show_alert=True)
-        return
-    await query.answer("Permissions refreshed")
-    await query.edit_message_text(
-        group_access_text(group, permissions),
-        parse_mode=ParseMode.HTML,
-        reply_markup=group_access_panel_kb(gid),
-    )
 
 
-async def group_control_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    if not query.message or query.message.chat.type != "private" or not is_owner(query.from_user.id):
-        await query.answer("❌ Sirf Owner.", show_alert=True)
-        return
-    try:
-        gid = int(query.data.split(":", 1)[1])
-    except Exception:
-        await query.answer("Invalid group.", show_alert=True)
-        return
-    group = groups_coll.find_one({"_id": gid}) if groups_coll is not None else None
-    if not group:
-        await query.answer("Group record nahi mila.", show_alert=True)
-        return
-    permissions, error = await get_bot_group_permissions(context, gid)
-    if error:
-        await query.answer(error, show_alert=True)
-        return
-
-    lines = [
-        f"{pe('🛡')} <b>MODERATION COMMANDS</b>",
-        "──────────────────",
-        f"<b>{esc(group.get('title', 'Group'))}</b>",
-        "",
-        "<b>Owner-only commands inside this authorized group:</b>",
-        "",
-        "🚫 /ban — reply to user/message or use user ID",
-        "♻️ /unban — user ID",
-        "🔇 /mute — reply to user/message + minutes",
-        "🔊 /unmute — user ID / reply",
-        "🗑 /del — reply to message",
-        "",
-        "⚠️ <b>/banall:</b> Telegram Bot API does not provide a complete member list, so a safe one-command ban-all cannot be implemented reliably. It is intentionally not enabled.",
-        "",
-        "<b>Bot permission status:</b>",
-    ]
-    for key, label in GROUP_ACCESS:
-        lines.append(f"{'🟢' if permissions.get(key, False) else '🔴'} {label}")
-
-    await query.answer()
-    await query.edit_message_text(
-        "\n".join(lines),
-        parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🛡 View All Permissions", callback_data=f"groupaccess:{gid}")],
-            [InlineKeyboardButton("◀ Back to Groups", callback_data="groups:back")],
-        ]),
-    )
 
 
 async def groups_back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1721,93 +1630,14 @@ async def _resolve_moderation_user(update, context):
     return None
 
 
-async def ban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await _owner_authorized_group(update, context, "can_ban_members"):
-        return
-    user = await _resolve_moderation_user(update, context)
-    if not user:
-        await update.message.reply_text("Usage: /ban <user_id/@username> ya user ke message par reply karke /ban")
-        return
-    try:
-        await context.bot.ban_chat_member(update.effective_chat.id, user.id)
-        await update.message.reply_text(f"🚫 Banned: <a href=\"tg://user?id={user.id}\">{esc(user.first_name)}</a>", parse_mode=ParseMode.HTML)
-    except Exception as e:
-        await update.message.reply_text(f"❌ Ban failed: {esc(e)}", parse_mode=ParseMode.HTML)
 
 
-async def unban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await _owner_authorized_group(update, context, "can_ban_members"):
-        return
-    if not context.args or not context.args[0].lstrip("@").isdigit():
-        await update.message.reply_text("Usage: /unban <user_id>")
-        return
-    uid = int(context.args[0].lstrip("@"))
-    try:
-        await context.bot.unban_chat_member(update.effective_chat.id, uid, only_if_banned=True)
-        await update.message.reply_text(f"♻️ Unbanned: <code>{uid}</code>", parse_mode=ParseMode.HTML)
-    except Exception as e:
-        await update.message.reply_text(f"❌ Unban failed: {esc(e)}", parse_mode=ParseMode.HTML)
 
 
-async def mute_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await _owner_authorized_group(update, context, "can_restrict_members"):
-        return
-    user = await _resolve_moderation_user(update, context)
-    if not user:
-        await update.message.reply_text("Usage: /mute <user_id> <minutes> ya reply karke /mute <minutes>")
-        return
-    minutes_arg = context.args[-1] if context.args else "60"
-    try:
-        minutes = max(1, int(minutes_arg))
-    except ValueError:
-        minutes = 60
-    until = datetime.now(timezone.utc).timestamp() + minutes * 60
-    try:
-        from datetime import timedelta
-        until_dt = datetime.now(timezone.utc) + timedelta(minutes=minutes)
-        await context.bot.restrict_chat_member(
-            update.effective_chat.id, user.id,
-            permissions=ChatPermissions(can_send_messages=False),
-            until_date=until_dt,
-        )
-        await update.message.reply_text(f"🔇 Muted <code>{user.id}</code> for {minutes} minute(s).", parse_mode=ParseMode.HTML)
-    except Exception as e:
-        await update.message.reply_text(f"❌ Mute failed: {esc(e)}", parse_mode=ParseMode.HTML)
 
 
-async def unmute_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await _owner_authorized_group(update, context, "can_restrict_members"):
-        return
-    user = await _resolve_moderation_user(update, context)
-    if not user and context.args and context.args[0].isdigit():
-        try:
-            user = (await context.bot.get_chat_member(update.effective_chat.id, int(context.args[0]))).user
-        except Exception:
-            pass
-    if not user:
-        await update.message.reply_text("Usage: /unmute <user_id> ya user ke message par reply karke /unmute")
-        return
-    try:
-        await context.bot.restrict_chat_member(
-            update.effective_chat.id, user.id,
-            permissions=ChatPermissions(can_send_messages=True, can_send_audios=True, can_send_documents=True, can_send_photos=True, can_send_videos=True, can_send_video_notes=True, can_send_voice_notes=True, can_send_polls=True, can_send_other_messages=True),
-        )
-        await update.message.reply_text(f"🔊 Unmuted <code>{user.id}</code>.", parse_mode=ParseMode.HTML)
-    except Exception as e:
-        await update.message.reply_text(f"❌ Unmute failed: {esc(e)}", parse_mode=ParseMode.HTML)
 
 
-async def del_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await _owner_authorized_group(update, context, "can_delete_messages"):
-        return
-    if not update.message.reply_to_message:
-        await update.message.reply_text("❌ Kisi message par reply karke /del use karo.")
-        return
-    try:
-        await context.bot.delete_message(update.effective_chat.id, update.message.reply_to_message.message_id)
-        await update.message.delete()
-    except Exception as e:
-        await update.message.reply_text(f"❌ Delete failed: {esc(e)}", parse_mode=ParseMode.HTML)
 
 
 
@@ -1861,7 +1691,7 @@ async def bot_chat_member_update(update: Update, context: ContextTypes.DEFAULT_T
         ensure_group_runtime(chat.id)
 
     except Exception as exc:
-        print(f"⚠️ bot_chat_member_update error: {exc}")
+        log_event("GROUP", "bot membership update failed: %s", logging.ERROR, exc)
 
 # ===========================
 # OWNER GROUP CONTROL PANEL
@@ -2030,6 +1860,7 @@ def group_access_text(group, permissions):
 
 
 async def group_access_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    log_event("COMMAND", "/groupaccess | user=%s", logging.INFO, update.effective_user.id)
     if update.effective_chat.type != "private" or not is_owner(update.effective_user.id):
         return
     if groups_coll is None:
@@ -2067,6 +1898,7 @@ async def group_access_callback(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     gid = int(query.data.split(":", 1)[1])
+    log_event("CALLBACK", "Access click | user=%s | group=%s", logging.INFO, query.from_user.id, gid)
     group = groups_coll.find_one({"_id": gid}) if groups_coll else None
     if not group:
         await query.answer("Group record nahi mila.", show_alert=True)
@@ -2275,6 +2107,7 @@ def groups_kb():
 
 
 async def groups_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    log_event("COMMAND", "/groups | user=%s", logging.INFO, update.effective_user.id)
     if update.effective_chat.type != "private" or not is_owner(update.effective_user.id):
         return
 
@@ -2349,6 +2182,7 @@ async def group_auth_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     authorized = action == "on"
+    log_event("GROUP", "authorization change | group=%s | authorized=%s | by=%s", logging.INFO, gid, authorized, query.from_user.id)
     groups_coll.update_one(
         {"_id": gid},
         {"$set": {
@@ -2700,7 +2534,28 @@ def start_dummy_server():
 
     server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    print(f"✅ Dummy HTTP server listening on port {port}")
+    log_event("HTTP", "health server listening on port %d", logging.INFO, port)
+
+
+# ===========================
+# GLOBAL ERROR HANDLER
+# ===========================
+
+async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    error = context.error
+    logger.error(
+        "[ERROR] unhandled exception | update=%s | error=%s",
+        type(update).__name__,
+        error,
+        exc_info=(type(error), error, error.__traceback__) if error else None,
+    )
+
+    query = getattr(update, "callback_query", None)
+    if query:
+        try:
+            await query.answer("❌ Something went wrong. Please try again.", show_alert=True)
+        except Exception:
+            pass
 
 
 # ===========================
@@ -2708,6 +2563,7 @@ def start_dummy_server():
 # ===========================
 
 def main():
+    log_event("BOOT", "initializing | mongo=%s | owners=%d", logging.INFO, bool(mongo_client), len(OWNER_IDS))
     start_dummy_server()
 
     try:
@@ -2747,8 +2603,6 @@ def main():
     app.add_handler(
         CallbackQueryHandler(group_auth_callback, pattern=r"^groupauth:(on|off):")
     )
-    app.add_handler(CallbackQueryHandler(groups_back_callback, pattern=r"^groups:back$"))
-
     # Existing callbacks remain unchanged.
     app.add_handler(MessageHandler(filters.ALL, auto_moderate_message), group=1)
 
@@ -2785,8 +2639,9 @@ def main():
     )
 
     app.add_handler(CallbackQueryHandler(callback_router))
+    app.add_error_handler(global_error_handler)
 
-    print("✅ RizzlerXEscrow Bot Running...")
+    log_event("BOOT", "RizzlerXEscrow Bot starting polling")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
