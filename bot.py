@@ -130,280 +130,11 @@ def register_group(chat, bot_status=None):
 def group_is_authorized(chat_id):
     if groups_coll is None:
         return False
-    doc = groups_coll.find_one({"_id": chat_id})
+    try:
+        doc = groups_coll.find_one({"_id": int(chat_id)})
+    except Exception:
+        doc = groups_coll.find_one({"_id": chat_id})
     return bool(doc and doc.get("authorized") is True)
-
-
-def group_control_allowed(update: Update):
-    """Authorized group me hi group-side bot features chalengi."""
-    chat = update.effective_chat
-    if chat.type not in ("group", "supergroup"):
-        return True, None
-
-    register_group(chat)
-
-    if groups_coll is None:
-        return False, "❌ Group authorization ke liye MongoDB required hai."
-
-    if not group_is_authorized(chat.id):
-        return False, (
-            "❌ Ye group abhi Owner ne authorize nahi kiya.\n"
-            "Owner private chat me /groups kholkar is group ko authorize kare."
-        )
-
-    return True, None
-
-
-async def bot_chat_member_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Bot add/remove/promote hone par group registry automatically update hoti hai."""
-    cm = update.my_chat_member
-    if not cm:
-        return
-
-    chat = cm.chat
-    if chat.type not in ("group", "supergroup"):
-        return
-
-    new_status = cm.new_chat_member.status
-    old_status = cm.old_chat_member.status
-
-    # Bot group me available hai -> register karo.
-    if new_status in ("member", "administrator", "creator"):
-        register_group(chat, bot_status=new_status)
-
-        # Pehli baar add hua ho to default unauthorized rahega.
-        # Existing authorized group ko re-add par bhi safe default ke liye
-        # dobara owner approval chahiye.
-        if groups_coll is not None and old_status in ("left", "kicked"):
-            groups_coll.update_one(
-                {"_id": chat.id},
-                {"$set": {
-                    "authorized": False,
-                    "reauthorized_required": True,
-                    "updated_at": datetime.now(timezone.utc).isoformat(),
-                }},
-                upsert=True,
-            )
-    else:
-        # Bot removed/kicked: record delete nahi karte, /groups me history dikhegi.
-        register_group(chat, bot_status=new_status)
-        if groups_coll is not None:
-            groups_coll.update_one(
-                {"_id": chat.id},
-                {"$set": {
-                    "authorized": False,
-                    "updated_at": datetime.now(timezone.utc).isoformat(),
-                }},
-            )
-
-
-async def group_admin_allowed(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Authorized group ka Telegram admin/creator check."""
-    ok, reason = group_control_allowed(update)
-    if not ok:
-        return False, reason
-
-    chat = update.effective_chat
-    if chat.type not in ("group", "supergroup"):
-        return False, None
-
-    try:
-        member = await context.bot.get_chat_member(
-            chat.id, update.effective_user.id
-        )
-    except Exception:
-        return False, "❌ Tumhara group-admin status check nahi ho paaya."
-
-    if member.status not in ("administrator", "creator"):
-        return False, None
-
-    return True, None
-
-
-def target_username_from_id(user_id):
-    """Known Mongo/user/deal records se username nikalo."""
-    if users_coll is not None:
-        doc = users_coll.find_one({"_id": user_id})
-        if doc and doc.get("username"):
-            return "@" + str(doc["username"]).lstrip("@")
-
-    if admins_coll is not None:
-        doc = admins_coll.find_one({"_id": user_id})
-        if doc and doc.get("username"):
-            return "@" + str(doc["username"]).lstrip("@")
-
-    for deal in DEALS.values():
-        if deal.get("created_by_id") == user_id or deal.get("escrowed_by_id") == user_id:
-            name = deal.get("escrowed_by")
-            if name and str(name).startswith("@"):
-                return str(name)
-
-    return None
-
-
-def normalize_target_username(value):
-    value = (value or "").strip()
-    if not value:
-        return None
-    return value if value.startswith("@") else "@" + value
-
-
-def find_user_target(context, update):
-    """
-    /stats target resolve:
-      /stats 123456789
-      /stats @username
-      /stats username
-      /stats (reply to user's message)
-    Returns: (user_id, username, first_name)
-    """
-    target_user = None
-    target_id = None
-    target_username = None
-
-    if update.message and update.message.reply_to_message:
-        target_user = update.message.reply_to_message.from_user
-        if target_user:
-            target_id = target_user.id
-            target_username = (
-                "@" + target_user.username if target_user.username else None
-            )
-
-    elif context.args:
-        raw = context.args[0].strip()
-        if raw.isdigit():
-            target_id = int(raw)
-        else:
-            target_username = normalize_target_username(raw)
-
-    else:
-        target_user = update.effective_user
-        target_id = target_user.id
-        target_username = (
-            "@" + target_user.username if target_user.username else None
-        )
-
-    first_name = None
-
-    if target_user:
-        first_name = target_user.first_name
-
-    if target_id is not None:
-        db_username = target_username_from_id(target_id)
-        if db_username:
-            target_username = db_username
-
-        if users_coll is not None:
-            doc = users_coll.find_one({"_id": target_id})
-            if doc:
-                first_name = first_name or doc.get("first_name")
-
-    if target_username and users_coll is not None:
-        uname = target_username.lstrip("@")
-        doc = users_coll.find_one({"username": uname})
-        if doc:
-            target_id = doc.get("_id")
-            first_name = first_name or doc.get("first_name")
-
-    if target_username:
-        target_username = normalize_target_username(target_username)
-
-    return target_id, target_username, first_name
-
-
-def status_for_target(user_id, username, first_name="User"):
-    """Kisi bhi user ka status, bina Update object ko mutate kiye."""
-    username = normalize_target_username(username) if username else None
-
-    mine = []
-    for tid, deal in DEALS.items():
-        if user_id is not None and (
-            deal.get("escrowed_by_id") == user_id
-            or deal.get("created_by_id") == user_id
-        ):
-            mine.append(deal)
-        elif username and deal.get("escrowed_by") == username:
-            mine.append(deal)
-
-    completed = [d for d in mine if d.get("status") == "COMPLETED"]
-    active = [d for d in mine if d.get("status") == "ACTIVE"]
-
-    totals = {"TON": 0.0, "USDT": 0.0, "INR": 0.0}
-    for d in completed:
-        cur = d.get("currency", "INR")
-        totals[cur] = totals.get(cur, 0.0) + float(d.get("amount", 0) or 0)
-
-    board = build_leaderboard(today_only=False)
-    rank_key = username or (f"id:{user_id}" if user_id is not None else "-")
-    rank = get_rank(rank_key, board, by="deals")
-
-    display = username or (f"ID {user_id}" if user_id is not None else "Unknown User")
-
-    return (
-        f"{pe('📈')} <b>{esc(first_name or display)} Deal status !</b>\n"
-        f"{pe('🆔')} User ➤ <code>{esc(display)}</code>\n"
-        "──────────────────\n"
-        f"{pe('🚀')} Rank ➤ #{rank}\n\n"
-        f"{pe('🔥')} Active deals ➤ {len(active)}\n\n"
-        f"{pe('✅')} Total Escrow's ➤ {len(completed)}\n\n"
-        f"{pe('⚡')} Total Volume :\n"
-        f"  {pe('🪙')} ➤ {totals['TON']:g} TON\n"
-        f"  {pe('💰')} ➤ {totals['USDT']:g} USDT\n"
-        f"  {pe('🤑')} ➤ {totals['INR']:g} ₹\n"
-        "──────────────────\n"
-        f"{pe('📱')} Escrow Bot for {BRAND}\n"
-        f"{pe('💤')} Provided by {PROVIDER} !"
-    )
-
-
-async def add_close_allowed(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /add aur /close ke liye permission check:
-
-    - Private chat: sirf hamari internal list wale bot-admin/owner (BOT_ADMINS / OWNER_IDS)
-      use kar sakte hai.
-    - Group / Supergroup: us GROUP ka Telegram-level admin ya owner (creator) use kar
-      sakta hai — chahe wo hamari internal BOT_ADMINS list me ho ya na ho. Saath hi,
-      BOT khud bhi us group me admin/owner hona chahiye, warna message delete/manage
-      permission nahi milegi aur command kaam nahi karegi.
-
-    Return: (allowed: bool, reason: str | None)
-    reason sirf tab bheja jaata hai jab helpful diagnostic dena ho (warna silent skip).
-    """
-    chat = update.effective_chat
-    user_id = update.effective_user.id
-
-    if chat.type in ("group", "supergroup"):
-        group_ok, group_reason = await group_admin_allowed(update, context)
-        if not group_ok:
-            return False, group_reason
-
-    if chat.type == "private":
-        return is_admin(user_id), None
-
-    if chat.type not in ("group", "supergroup"):
-        return False, None
-
-    # 1) Bot khud us group me admin/owner hai?
-    try:
-        bot_member = await context.bot.get_chat_member(chat.id, context.bot.id)
-    except Exception:
-        return False, "❌ Bot ka admin status is group me check nahi ho paaya."
-    if bot_member.status not in ("administrator", "creator"):
-        return False, (
-            "❌ Ye command tabhi kaam karegi jab BOT is group me Admin ho "
-            "(pehle bot ko group me admin banao)."
-        )
-
-    # 2) Command chalane wala us group ka admin/owner hai?
-    try:
-        user_member = await context.bot.get_chat_member(chat.id, user_id)
-    except Exception:
-        return False, "❌ Tumhara admin status is group me check nahi ho paaya."
-    if user_member.status not in ("administrator", "creator"):
-        return False, None  # normal member ke liye silent skip
-
-    return True, None
 
 
 # ===========================
@@ -938,7 +669,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # /status  — HAR USER, PRIVATE + GROUP dono me kaam karega
 # ===========================
 
-async def mystatus_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def _legacy_mystatus_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /stats
       - Normal user: apna status.
@@ -2319,6 +2050,137 @@ async def automod_num_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     )
 
 
+
+# ===========================
+# ROBUST /stats ROUTER
+# ===========================
+
+async def mystatus_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Keep existing stats rendering, but correctly resolve group targets."""
+    if not update.message:
+        return
+
+    chat = update.effective_chat
+    user = update.effective_user
+
+    # In groups, all stats access is restricted to authorized groups.
+    if chat.type in ("group", "supergroup"):
+        ok, reason = await group_control_allowed(update)
+        if not ok:
+            await update.message.reply_text(reason)
+            return
+
+    target = user
+
+    # Reply target: /stats used as a reply to a user's message.
+    if update.message.reply_to_message and update.message.reply_to_message.from_user:
+        target = update.message.reply_to_message.from_user
+
+    # Explicit target: /stats <user_id> or /stats @username
+    elif context.args:
+        raw = context.args[0].strip()
+
+        if raw.lstrip("-").isdigit():
+            uid = int(raw)
+            try:
+                member = await context.bot.get_chat_member(chat.id, uid)
+                target = member.user
+            except Exception:
+                # For private chat, fall back to local user/deal records.
+                target = None
+                if users_coll is not None:
+                    doc = users_coll.find_one({
+                        "$or": [
+                            {"user_id": uid},
+                            {"_id": uid},
+                            {"telegram_id": uid},
+                        ]
+                    })
+                    if doc:
+                        class _U:
+                            pass
+                        target = _U()
+                        target.id = uid
+                        target.username = doc.get("username")
+                        target.first_name = doc.get("first_name") or doc.get("name") or str(uid)
+                        target.last_name = doc.get("last_name")
+                        target.is_bot = False
+                if target is None:
+                    await update.message.reply_text("❌ User group me nahi mila.")
+                    return
+
+        else:
+            username = raw.lstrip("@").lower()
+            found = None
+
+            # Telegram cannot reliably resolve arbitrary usernames through Bot API,
+            # so first try current chat members where possible, then local DB.
+            if chat.type in ("group", "supergroup"):
+                try:
+                    # get_chat_member needs ID, not username; use local records below.
+                    pass
+                except Exception:
+                    pass
+
+            if users_coll is not None:
+                found = users_coll.find_one({
+                    "$or": [
+                        {"username": username},
+                        {"username": f"@{username}"},
+                        {"telegram_username": username},
+                        {"telegram_username": f"@{username}"},
+                    ]
+                })
+
+            if found:
+                class _U:
+                    pass
+                target = _U()
+                target.id = found.get("user_id") or found.get("_id") or found.get("telegram_id")
+                target.username = found.get("username") or username
+                target.first_name = found.get("first_name") or found.get("name") or username
+                target.last_name = found.get("last_name")
+                target.is_bot = False
+            else:
+                await update.message.reply_text(
+                    "❌ @username database me nahi mila. "
+                    "User ke message par reply karke /stats use karo."
+                )
+                return
+
+    # Group: non-admin can only see own stats. Admin/owner can inspect another user.
+    if chat.type in ("group", "supergroup") and target.id != user.id:
+        allowed = is_owner(user.id)
+        if not allowed:
+            try:
+                member = await context.bot.get_chat_member(chat.id, user.id)
+                allowed = member.status in ("administrator", "creator")
+            except Exception:
+                allowed = False
+        if not allowed:
+            await update.message.reply_text("❌ Sirf group admin/owner kisi aur user ka /stats dekh sakta hai.")
+            return
+
+    # Reuse the original rendering implementation by temporarily invoking it
+    # with the target encoded in context.
+    context.user_data["_stats_target_user"] = target
+
+    # The legacy function may use update.effective_user. We replace that reference
+    # only within a lightweight proxy update.
+    class _ProxyUpdate:
+        def __init__(self, original, target_user):
+            self._original = original
+            self.effective_user = target_user
+            self.effective_chat = original.effective_chat
+            self.message = original.message
+            self.callback_query = original.callback_query
+
+    try:
+        await _legacy_mystatus_cmd(_ProxyUpdate(update, target), context)
+    finally:
+        context.user_data.pop("_stats_target_user", None)
+
+
 # ===========================
 # /groups — OWNER ONLY
 # ===========================
@@ -2818,25 +2680,42 @@ def main():
     app.add_handler(
         CallbackQueryHandler(group_auth_callback, pattern=r"^groupauth:(on|off):")
     )
-    app.add_handler(CallbackQueryHandler(group_access_callback, pattern=r"^groupaccess:-?\d+$"))
-    app.add_handler(CallbackQueryHandler(group_control_callback, pattern=r"^groupcontrol:-?\d+$"))
     app.add_handler(CallbackQueryHandler(groups_back_callback, pattern=r"^groups:back$"))
 
+    # Existing callbacks remain unchanged.
+    app.add_handler(MessageHandler(filters.ALL, auto_moderate_message), group=1)
+
+    # Owner group-control callbacks MUST be registered before the generic router.
+    app.add_handler(
+        CallbackQueryHandler(group_access_callback, pattern=r"^groupaccess:-?\d+$")
+    )
+    app.add_handler(
+        CallbackQueryHandler(group_control_callback, pattern=r"^groupcontrol:-?\d+$")
+    )
     app.add_handler(
         CallbackQueryHandler(automod_callback, pattern=r"^automod:-?\d+$")
     )
     app.add_handler(
-        CallbackQueryHandler(automod_toggle_callback, pattern=r"^automodtoggle:(auto_ban|auto_mute|anti_spam|anti_link):-?\d+$")
+        CallbackQueryHandler(
+            automod_toggle_callback,
+            pattern=r"^automodtoggle:(auto_ban|auto_mute|anti_spam|anti_link):-?\d+$",
+        )
     )
     app.add_handler(
-        CallbackQueryHandler(automod_num_callback, pattern=r"^automodnum:(spam_limit|spam_window|mute_minutes):-?\d+:-?\d+$")
+        CallbackQueryHandler(
+            automod_num_callback,
+            pattern=r"^automodnum:(spam_limit|spam_window|mute_minutes):-?\d+:-?\d+$",
+        )
     )
     app.add_handler(
-        CallbackQueryHandler(modhelp_callback, pattern=r"^modhelp:(ban|mute|unban|unmute|del):-?\d+$")
+        CallbackQueryHandler(
+            modhelp_callback,
+            pattern=r"^modhelp:(ban|mute|unban|unmute|del):-?\d+$",
+        )
     )
-
-    # Existing callbacks remain unchanged.
-    app.add_handler(MessageHandler(filters.ALL, auto_moderate_message))
+    app.add_handler(
+        CallbackQueryHandler(groups_back_callback, pattern=r"^groups:back$")
+    )
 
     app.add_handler(CallbackQueryHandler(callback_router))
 
