@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 from pymongo import MongoClient, ReturnDocument
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions
 from telegram.constants import ParseMode
+from telegram.error import BadRequest, Forbidden, TelegramError
 from telegram.ext import filters
 from telegram.ext import (
     Application,
@@ -62,7 +63,12 @@ logger = logging.getLogger("rizzlerxescrow")
 
 
 def log_event(scope, message, level=logging.INFO, *args):
-    logger.log(level, "[%-8s] " + message, scope, *args)
+    """Safe structured terminal logging. Never lets a bad format string crash logging."""
+    try:
+        rendered = message % args if args else message
+    except (TypeError, ValueError):
+        rendered = f"{message} | args={args!r}"
+    logger.log(level, "[%-8s] %s", scope, rendered)
 
 
 # ===========================
@@ -104,7 +110,7 @@ if coll is not None:
     for doc in coll.find({}):
         tid = doc.pop("_id")
         DEALS[tid] = doc
-    log_event("MONGO", "%d deal(s) loaded")
+    log_event("MONGO", "%d deal(s) loaded", logging.INFO, len(DEALS))
 
 
 # ---- Bot-admin set (owners + dynamically added admins) ----
@@ -112,7 +118,7 @@ BOT_ADMINS = set(OWNER_IDS)
 if admins_coll is not None:
     for doc in admins_coll.find({}):
         BOT_ADMINS.add(doc["_id"])
-    log_event("AUTH", "%d bot admin(s) loaded")
+    log_event("AUTH", "%d bot admin(s) loaded", logging.INFO, len(BOT_ADMINS))
 
 
 
@@ -769,6 +775,14 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data = query.data
     await query.answer()
+
+    log_event(
+        "CALLBACK",
+        "generic router | data=%s | user=%s",
+        logging.INFO,
+        data,
+        query.from_user.id if query.from_user else None,
+    )
 
     if data == "menu:back":
         # Private me full dashboard, group me wapas apne status pe.
@@ -1746,18 +1760,80 @@ def ensure_group_runtime(gid):
 
 
 async def get_bot_group_permissions(context, chat_id):
+    """Fetch the bot's current Telegram permissions for a group.
+
+    Telegram is the source of truth here; MongoDB only stores the group registry.
+    Errors are returned with the real Telegram exception so the owner can diagnose
+    missing membership/admin rights instead of receiving a generic failure.
+    """
     try:
         me = await context.bot.get_me()
-        member = await context.bot.get_chat_member(chat_id, me.id)
-    except Exception:
-        return None, "❌ Bot ka Telegram permission status fetch nahi ho paaya."
+        log_event(
+            "ACCESS",
+            "permission check | group=%s | bot=%s",
+            logging.INFO,
+            chat_id,
+            me.id,
+        )
 
-    if member.status not in ("administrator", "creator"):
-        return None, "❌ Bot is group me Admin nahi hai."
+        member = await context.bot.get_chat_member(chat_id=chat_id, user_id=me.id)
 
-    permissions = {"status": member.status}
-    for key, _ in GROUP_ACCESS:
+    except Forbidden as exc:
+        log_event(
+            "ACCESS",
+            "Telegram Forbidden | group=%s | %s",
+            logging.ERROR,
+            chat_id,
+            exc,
+        )
+        return None, "❌ Telegram ne permission check deny kar diya. Bot ko group me Admin rakho."
+
+    except BadRequest as exc:
+        log_event(
+            "ACCESS",
+            "Telegram BadRequest | group=%s | %s",
+            logging.ERROR,
+            chat_id,
+            exc,
+        )
+        return None, f"❌ Telegram error: {exc}"
+
+    except TelegramError as exc:
+        log_event(
+            "ACCESS",
+            "TelegramError | group=%s | %s",
+            logging.ERROR,
+            chat_id,
+            exc,
+        )
+        return None, f"❌ Telegram error: {exc}"
+
+    except Exception as exc:
+        log_event(
+            "ACCESS",
+            "unexpected permission error | group=%s | %r",
+            logging.ERROR,
+            chat_id,
+            exc,
+        )
+        return None, "❌ Permission check failed. Render logs me exact error dekho."
+
+    status = getattr(member, "status", None)
+    log_event(
+        "ACCESS",
+        "Telegram member status | group=%s | status=%s",
+        logging.INFO,
+        chat_id,
+        status,
+    )
+
+    if status not in ("administrator", "creator"):
+        return None, f"❌ Bot is group me Admin nahi hai. Current status: {status}"
+
+    permissions = {"status": status}
+    for key, _label in GROUP_ACCESS:  # keep one canonical permission list
         permissions[key] = bool(getattr(member, key, False))
+
     return permissions, None
 
 
@@ -1889,32 +1965,125 @@ async def group_access_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def group_access_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Owner-only Access button.
+
+    Follows PTB's documented callback pattern: answer the callback first, then
+    perform the Telegram/Mongo work and edit the message. Every failure is logged
+    with enough context to diagnose it from Render logs.
+    """
     query = update.callback_query
-    if not query.message or query.message.chat.type != "private":
-        await query.answer("Owner panel private chat me hai.", show_alert=True)
-        return
-    if not is_owner(query.from_user.id):
-        await query.answer("❌ Sirf Owner.", show_alert=True)
+    if query is None:
         return
 
-    gid = int(query.data.split(":", 1)[1])
-    log_event("CALLBACK", "Access click | user=%s | group=%s", logging.INFO, query.from_user.id, gid)
-    group = groups_coll.find_one({"_id": gid}) if groups_coll else None
-    if not group:
-        await query.answer("Group record nahi mila.", show_alert=True)
-        return
+    data = query.data or ""
+    user_id = query.from_user.id if query.from_user else None
 
-    permissions, error = await get_bot_group_permissions(context, gid)
-    if error:
-        await query.answer(error, show_alert=True)
-        return
-
-    await query.answer("Updated.")
-    await query.edit_message_text(
-        group_access_text(group, permissions),
-        parse_mode=ParseMode.HTML,
-        reply_markup=group_access_kb(gid),
+    log_event(
+        "CALLBACK",
+        "received | data=%s | user=%s | chat=%s",
+        logging.INFO,
+        data,
+        user_id,
+        getattr(getattr(query, "message", None), "chat_id", None),
     )
+
+    # Telegram expects every callback query to be answered. Do this immediately.
+    try:
+        await query.answer()
+    except TelegramError as exc:
+        log_event("CALLBACK", "answer failed | %s", logging.WARNING, exc)
+        # Continue: an expired callback should not prevent diagnostics.
+
+    try:
+        if not query.message:
+            log_event("CALLBACK", "missing callback message", logging.ERROR)
+            return
+
+        if query.message.chat.type != "private":
+            await query.answer(
+                "Owner panel private chat me hai.",
+                show_alert=True,
+            )
+            return
+
+        if not is_owner(user_id):
+            await query.answer("❌ Sirf Owner.", show_alert=True)
+            return
+
+        if not data.startswith("groupaccess:"):
+            log_event("CALLBACK", "invalid Access data=%s", logging.ERROR, data)
+            await query.answer("❌ Invalid Access callback.", show_alert=True)
+            return
+
+        try:
+            gid = int(data.split(":", 1)[1])
+        except (ValueError, IndexError):
+            log_event("CALLBACK", "invalid group id | data=%s", logging.ERROR, data)
+            await query.answer("❌ Invalid group ID.", show_alert=True)
+            return
+
+        if groups_coll is None:
+            await query.answer("❌ MongoDB unavailable.", show_alert=True)
+            return
+
+        group = groups_coll.find_one({"_id": gid})
+        if not group:
+            log_event("ACCESS", "group not found in Mongo | group=%s", logging.ERROR, gid)
+            await query.answer("❌ Group record nahi mila.", show_alert=True)
+            return
+
+        permissions, error = await get_bot_group_permissions(context, gid)
+        if error:
+            log_event(
+                "ACCESS",
+                "permission check failed | group=%s | %s",
+                logging.ERROR,
+                gid,
+                error,
+            )
+            await query.answer(error, show_alert=True)
+            return
+
+        text = group_access_text(group, permissions)
+        markup = group_access_kb(gid)
+
+        log_event("ACCESS", "rendering panel | group=%s", logging.INFO, gid)
+
+        try:
+            await query.edit_message_text(
+                text=text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=markup,
+                disable_web_page_preview=True,
+            )
+        except BadRequest as exc:
+            # Most useful case: message was already edited / markup is invalid.
+            log_event(
+                "ACCESS",
+                "edit_message_text BadRequest | group=%s | %s",
+                logging.ERROR,
+                gid,
+                exc,
+            )
+            await query.answer(f"❌ Telegram: {exc}", show_alert=True)
+            return
+
+        log_event("ACCESS", "panel opened successfully | group=%s", logging.INFO, gid)
+
+    except Exception as exc:
+        logger.exception(
+            "[ACCESS  ] callback crashed | user=%s | data=%s | error=%r",
+            user_id,
+            data,
+            exc,
+        )
+        try:
+            await query.answer(
+                "❌ Access panel error. Render logs me exact reason check karo.",
+                show_alert=True,
+            )
+        except Exception:
+            pass
 
 
 async def group_control_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2521,9 +2690,12 @@ def start_dummy_server():
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
+            body = b"RizzlerXEscrow bot is running"
             self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write(b"RizzlerXEscrow bot is running")
+            self.wfile.write(body)
 
         def do_HEAD(self):
             self.send_response(200)
@@ -2553,7 +2725,10 @@ async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYP
     query = getattr(update, "callback_query", None)
     if query:
         try:
-            await query.answer("❌ Something went wrong. Please try again.", show_alert=True)
+            await query.answer(
+                "❌ Internal error. Render logs me exact error check karo.",
+                show_alert=True,
+            )
         except Exception:
             pass
 
@@ -2571,7 +2746,11 @@ def main():
     except RuntimeError:
         asyncio.set_event_loop(asyncio.new_event_loop())
 
+    if not BOT_TOKEN:
+        raise RuntimeError("RIZZLER_BOT_TOKEN is missing from Render environment variables")
+
     app = Application.builder().token(BOT_TOKEN).build()
+    log_event("BOOT", "python-telegram-bot application created")
 
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("stats", mystatus_cmd))
@@ -2601,41 +2780,41 @@ def main():
 
     # Owner's /groups authorize/revoke buttons.
     app.add_handler(
-        CallbackQueryHandler(group_auth_callback, pattern=r"^groupauth:(on|off):")
+        CallbackQueryHandler(group_auth_callback, pattern=r"^groupauth:(on|off):"), group=-10
     )
     # Existing callbacks remain unchanged.
     app.add_handler(MessageHandler(filters.ALL, auto_moderate_message), group=1)
 
     # Owner group-control callbacks MUST be registered before the generic router.
     app.add_handler(
-        CallbackQueryHandler(group_access_callback, pattern=r"^groupaccess:-?\d+$")
+        CallbackQueryHandler(group_access_callback, pattern=r"^groupaccess:-?\d+$"), group=-10
     )
     app.add_handler(
-        CallbackQueryHandler(group_control_callback, pattern=r"^groupcontrol:-?\d+$")
+        CallbackQueryHandler(group_control_callback, pattern=r"^groupcontrol:-?\d+$"), group=-10
     )
     app.add_handler(
-        CallbackQueryHandler(automod_callback, pattern=r"^automod:-?\d+$")
+        CallbackQueryHandler(automod_callback, pattern=r"^automod:-?\d+$"), group=-10
     )
     app.add_handler(
         CallbackQueryHandler(
             automod_toggle_callback,
             pattern=r"^automodtoggle:(auto_ban|auto_mute|anti_spam|anti_link):-?\d+$",
-        )
+        ), group=-10
     )
     app.add_handler(
         CallbackQueryHandler(
             automod_num_callback,
             pattern=r"^automodnum:(spam_limit|spam_window|mute_minutes):-?\d+:-?\d+$",
-        )
+        ), group=-10
     )
     app.add_handler(
         CallbackQueryHandler(
             modhelp_callback,
             pattern=r"^modhelp:(ban|mute|unban|unmute|del):-?\d+$",
-        )
+        ), group=-10
     )
     app.add_handler(
-        CallbackQueryHandler(groups_back_callback, pattern=r"^groups:back$")
+        CallbackQueryHandler(groups_back_callback, pattern=r"^groups:back$"), group=-10
     )
 
     app.add_handler(CallbackQueryHandler(callback_router))
