@@ -1,5 +1,6 @@
 import os
 import re
+import time
 import html
 import asyncio
 import threading
@@ -10,11 +11,13 @@ from dotenv import load_dotenv
 from pymongo import MongoClient, ReturnDocument
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions
 from telegram.constants import ParseMode
+from telegram.ext import filters
 from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
     ChatMemberHandler,
+    MessageHandler,
     ContextTypes,
 )
 
@@ -51,6 +54,7 @@ meta_coll = mongo_db["meta_rizzlerxescrow"] if mongo_db is not None else None
 admins_coll = mongo_db["bot_admins_rizzlerxescrow"] if mongo_db is not None else None
 users_coll = mongo_db["broadcast_users_rizzlerxescrow"] if mongo_db is not None else None
 groups_coll = mongo_db["groups_rizzlerxescrow"] if mongo_db is not None else None
+automod_coll = mongo_db["group_automod_rizzlerxescrow"] if mongo_db is not None else None
 
 DEALS = {}
 
@@ -113,6 +117,8 @@ def register_group(chat, bot_status=None):
     if existing is None:
         data["authorized"] = False
         data["added_at"] = now
+
+    ensure_group_runtime(chat.id)
 
     groups_coll.update_one(
         {"_id": chat.id},
@@ -1974,6 +1980,345 @@ async def del_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Delete failed: {esc(e)}", parse_mode=ParseMode.HTML)
 
 
+
+# ===========================
+# OWNER GROUP CONTROL PANEL
+# ===========================
+
+GROUP_ACCESS = [
+    ("can_delete_messages", "🗑 Delete Messages"),
+    ("can_restrict_members", "🔇 Mute / Unmute"),
+    ("can_ban_members", "🚫 Ban / Unban Users"),
+    ("can_invite_users", "➕ Invite Users"),
+    ("can_pin_messages", "📌 Pin Messages"),
+    ("can_manage_topics", "🧵 Manage Topics"),
+    ("can_change_info", "✏️ Change Group Info"),
+]
+
+DEFAULT_AUTOMOD = {
+    "auto_ban": False,
+    "auto_mute": False,
+    "anti_spam": False,
+    "anti_link": False,
+    "spam_limit": 5,
+    "spam_window": 10,
+    "mute_minutes": 10,
+}
+
+
+def get_automod(gid):
+    if automod_coll is None:
+        return dict(DEFAULT_AUTOMOD)
+    doc = automod_coll.find_one({"_id": gid})
+    data = dict(DEFAULT_AUTOMOD)
+    if doc:
+        for k in data:
+            if k in doc:
+                data[k] = doc[k]
+    return data
+
+
+def save_automod(gid, data, owner_id):
+    if automod_coll is None:
+        return
+    data = dict(data)
+    data["_id"] = gid
+    data["updated_by"] = owner_id
+    data["updated_at"] = datetime.now(timezone.utc).isoformat()
+    automod_coll.update_one({"_id": gid}, {"$set": data}, upsert=True)
+
+
+def ensure_group_runtime(gid):
+    if automod_coll is not None and automod_coll.find_one({"_id": gid}) is None:
+        automod_coll.insert_one({"_id": gid, **DEFAULT_AUTOMOD})
+
+
+async def get_bot_group_permissions(context, chat_id):
+    try:
+        me = await context.bot.get_me()
+        member = await context.bot.get_chat_member(chat_id, me.id)
+    except Exception:
+        return None, "❌ Bot ka Telegram permission status fetch nahi ho paaya."
+
+    if member.status not in ("administrator", "creator"):
+        return None, "❌ Bot is group me Admin nahi hai."
+
+    permissions = {"status": member.status}
+    for key, _ in GROUP_ACCESS:
+        permissions[key] = bool(getattr(member, key, False))
+    return permissions, None
+
+
+def group_access_kb(gid):
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🔄 Refresh", callback_data=f"groupaccess:{gid}"),
+            InlineKeyboardButton("⚙️ Controls", callback_data=f"groupcontrol:{gid}"),
+        ],
+        [InlineKeyboardButton("🤖 Auto-Mod", callback_data=f"automod:{gid}")],
+        [InlineKeyboardButton("◀ Groups", callback_data="groups:back")],
+    ])
+
+
+def group_control_kb(gid):
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🚫 Ban User", callback_data=f"modhelp:ban:{gid}"),
+            InlineKeyboardButton("🔇 Mute User", callback_data=f"modhelp:mute:{gid}"),
+        ],
+        [
+            InlineKeyboardButton("♻️ Unban User", callback_data=f"modhelp:unban:{gid}"),
+            InlineKeyboardButton("🔊 Unmute User", callback_data=f"modhelp:unmute:{gid}"),
+        ],
+        [InlineKeyboardButton("🗑 Delete Message", callback_data=f"modhelp:del:{gid}")],
+        [
+            InlineKeyboardButton("🤖 Auto-Mod", callback_data=f"automod:{gid}"),
+            InlineKeyboardButton("🛡 Permissions", callback_data=f"groupaccess:{gid}"),
+        ],
+        [InlineKeyboardButton("◀ Groups", callback_data="groups:back")],
+    ])
+
+
+def automod_kb(gid, data):
+    def mark(key):
+        return "🟢" if data.get(key) else "🔴"
+
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"{mark('auto_ban')} Auto-Ban", callback_data=f"automodtoggle:auto_ban:{gid}")],
+        [InlineKeyboardButton(f"{mark('auto_mute')} Auto-Mute", callback_data=f"automodtoggle:auto_mute:{gid}")],
+        [InlineKeyboardButton(f"{mark('anti_spam')} Anti-Spam", callback_data=f"automodtoggle:anti_spam:{gid}")],
+        [InlineKeyboardButton(f"{mark('anti_link')} Anti-Link", callback_data=f"automodtoggle:anti_link:{gid}")],
+        [
+            InlineKeyboardButton("➖ Spam Limit", callback_data=f"automodnum:spam_limit:-1:{gid}"),
+            InlineKeyboardButton(str(data.get("spam_limit", 5)), callback_data=f"automodnum:spam_limit:0:{gid}"),
+            InlineKeyboardButton("➕", callback_data=f"automodnum:spam_limit:1:{gid}"),
+        ],
+        [
+            InlineKeyboardButton("➖ Window", callback_data=f"automodnum:spam_window:-1:{gid}"),
+            InlineKeyboardButton(f"{data.get('spam_window', 10)}s", callback_data=f"automodnum:spam_window:0:{gid}"),
+            InlineKeyboardButton("➕", callback_data=f"automodnum:spam_window:1:{gid}"),
+        ],
+        [
+            InlineKeyboardButton("➖ Mute", callback_data=f"automodnum:mute_minutes:-1:{gid}"),
+            InlineKeyboardButton(f"{data.get('mute_minutes', 10)}m", callback_data=f"automodnum:mute_minutes:0:{gid}"),
+            InlineKeyboardButton("➕", callback_data=f"automodnum:mute_minutes:1:{gid}"),
+        ],
+        [
+            InlineKeyboardButton("🔄 Refresh", callback_data=f"automod:{gid}"),
+            InlineKeyboardButton("◀ Controls", callback_data=f"groupcontrol:{gid}"),
+        ],
+    ])
+
+
+def automod_text(group, data):
+    return (
+        f"{pe('🤖')} <b>AUTO-MODERATION</b>\n"
+        "──────────────────\n"
+        f"<b>Group:</b> {esc(group.get('title', 'Group'))}\n"
+        f"<b>ID:</b> <code>{group.get('_id')}</code>\n\n"
+        f"{'🟢' if data.get('auto_ban') else '🔴'} Auto-Ban\n"
+        f"{'🟢' if data.get('auto_mute') else '🔴'} Auto-Mute\n"
+        f"{'🟢' if data.get('anti_spam') else '🔴'} Anti-Spam\n"
+        f"{'🟢' if data.get('anti_link') else '🔴'} Anti-Link\n\n"
+        f"Spam: <b>{data.get('spam_limit', 5)} messages / "
+        f"{data.get('spam_window', 10)} sec</b>\n"
+        f"Mute: <b>{data.get('mute_minutes', 10)} min</b>\n\n"
+        "⚠️ Admins, Owner aur bots ko Auto-Mod ignore karega."
+    )
+
+
+def group_access_text(group, permissions):
+    lines = [
+        f"{pe('🛡')} <b>BOT ACCESS PANEL</b>",
+        "──────────────────",
+        f"<b>Group:</b> {esc(group.get('title', 'Group'))}",
+        f"<b>ID:</b> <code>{group.get('_id')}</code>",
+        "",
+    ]
+    if not permissions:
+        lines.append("🔴 Permission data unavailable.")
+        return "\n".join(lines)
+
+    lines.append(f"<b>Bot status:</b> <code>{permissions.get('status')}</code>")
+    lines.append("")
+    for key, label in GROUP_ACCESS:
+        lines.append(f"{'🟢' if permissions.get(key) else '🔴'} {label}")
+    lines += ["", "🟢 Available    🔴 Missing"]
+    return "\n".join(lines)
+
+
+async def group_access_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != "private" or not is_owner(update.effective_user.id):
+        return
+    if groups_coll is None:
+        await update.message.reply_text("❌ MongoDB required.")
+        return
+    if not context.args or not context.args[0].lstrip("-").isdigit():
+        await update.message.reply_text("Usage: /groupaccess <group_id>")
+        return
+
+    gid = int(context.args[0])
+    group = groups_coll.find_one({"_id": gid})
+    if not group:
+        await update.message.reply_text("❌ Group record nahi mila.")
+        return
+
+    permissions, error = await get_bot_group_permissions(context, gid)
+    if error:
+        await update.message.reply_text(error)
+        return
+
+    await update.message.reply_text(
+        group_access_text(group, permissions),
+        parse_mode=ParseMode.HTML,
+        reply_markup=group_access_kb(gid),
+    )
+
+
+async def group_access_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query.message or query.message.chat.type != "private":
+        await query.answer("Owner panel private chat me hai.", show_alert=True)
+        return
+    if not is_owner(query.from_user.id):
+        await query.answer("❌ Sirf Owner.", show_alert=True)
+        return
+
+    gid = int(query.data.split(":", 1)[1])
+    group = groups_coll.find_one({"_id": gid}) if groups_coll else None
+    if not group:
+        await query.answer("Group record nahi mila.", show_alert=True)
+        return
+
+    permissions, error = await get_bot_group_permissions(context, gid)
+    if error:
+        await query.answer(error, show_alert=True)
+        return
+
+    await query.answer("Updated.")
+    await query.edit_message_text(
+        group_access_text(group, permissions),
+        parse_mode=ParseMode.HTML,
+        reply_markup=group_access_kb(gid),
+    )
+
+
+async def group_control_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query.message or query.message.chat.type != "private":
+        await query.answer("Owner panel private chat me hai.", show_alert=True)
+        return
+    if not is_owner(query.from_user.id):
+        await query.answer("❌ Sirf Owner.", show_alert=True)
+        return
+
+    gid = int(query.data.split(":", 1)[1])
+    group = groups_coll.find_one({"_id": gid}) if groups_coll else None
+    if not group:
+        await query.answer("Group record nahi mila.", show_alert=True)
+        return
+
+    await query.answer()
+    await query.edit_message_text(
+        f"{pe('⚙️')} <b>GROUP CONTROL</b>\n"
+        "──────────────────\n"
+        f"<b>{esc(group.get('title', 'Group'))}</b>\n\n"
+        "Owner-only moderation controls.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=group_control_kb(gid),
+    )
+
+
+async def modhelp_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not is_owner(query.from_user.id):
+        await query.answer("❌ Sirf Owner.", show_alert=True)
+        return
+
+    _, action, _gid = query.data.split(":", 2)
+    command_map = {
+        "ban": "/ban — target user ke message par reply karo",
+        "unban": "/unban <user_id>",
+        "mute": "/mute <minutes> — target message par reply karo",
+        "unmute": "/unmute — target message par reply karo",
+        "del": "/del — target message par reply karo",
+    }
+    await query.answer(command_map[action], show_alert=True)
+
+
+async def automod_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not is_owner(query.from_user.id):
+        await query.answer("❌ Sirf Owner.", show_alert=True)
+        return
+
+    gid = int(query.data.split(":", 1)[1])
+    group = groups_coll.find_one({"_id": gid}) if groups_coll else None
+    if not group:
+        await query.answer("Group record nahi mila.", show_alert=True)
+        return
+
+    ensure_group_runtime(gid)
+    data = get_automod(gid)
+    await query.answer()
+    await query.edit_message_text(
+        automod_text(group, data),
+        parse_mode=ParseMode.HTML,
+        reply_markup=automod_kb(gid, data),
+    )
+
+
+async def automod_toggle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not is_owner(query.from_user.id):
+        await query.answer("❌ Sirf Owner.", show_alert=True)
+        return
+
+    _, key, gid_text = query.data.split(":", 2)
+    gid = int(gid_text)
+    data = get_automod(gid)
+    data[key] = not bool(data.get(key))
+    save_automod(gid, data, query.from_user.id)
+
+    group = groups_coll.find_one({"_id": gid})
+    await query.answer("Updated.")
+    await query.edit_message_text(
+        automod_text(group, data),
+        parse_mode=ParseMode.HTML,
+        reply_markup=automod_kb(gid, data),
+    )
+
+
+async def automod_num_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not is_owner(query.from_user.id):
+        await query.answer("❌ Sirf Owner.", show_alert=True)
+        return
+
+    _, key, delta_text, gid_text = query.data.split(":", 3)
+    gid = int(gid_text)
+    delta = int(delta_text)
+
+    data = get_automod(gid)
+    if delta:
+        limits = {
+            "spam_limit": (1, 30),
+            "spam_window": (3, 60),
+            "mute_minutes": (1, 1440),
+        }
+        lo, hi = limits[key]
+        data[key] = max(lo, min(hi, int(data.get(key, DEFAULT_AUTOMOD[key])) + delta))
+        save_automod(gid, data, query.from_user.id)
+
+    group = groups_coll.find_one({"_id": gid})
+    await query.answer()
+    await query.edit_message_text(
+        automod_text(group, data),
+        parse_mode=ParseMode.HTML,
+        reply_markup=automod_kb(gid, data),
+    )
+
+
 # ===========================
 # /groups — OWNER ONLY
 # ===========================
@@ -2124,6 +2469,244 @@ async def group_auth_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
 
 
+
+# ===========================
+# OWNER GROUP MODERATION
+# ===========================
+
+async def owner_group_mod_allowed(update, context, permission):
+    if not is_owner(update.effective_user.id):
+        return False, "❌ Sirf Owner."
+    if update.effective_chat.type not in ("group", "supergroup"):
+        return False, "❌ Ye command group me use karo."
+
+    ok, reason = await group_control_allowed(update)
+    if not ok:
+        return False, reason
+
+    try:
+        bot_member = await context.bot.get_chat_member(
+            update.effective_chat.id, context.bot.id
+        )
+    except Exception:
+        return False, "❌ Bot permission check fail hua."
+
+    if bot_member.status != "administrator" or not getattr(bot_member, permission, False):
+        return False, "❌ Bot ke paas required Telegram permission nahi hai."
+
+    return True, None
+
+
+async def ban_cmd(update, context):
+    ok, reason = await owner_group_mod_allowed(update, context, "can_ban_members")
+    if not ok:
+        await update.message.reply_text(reason)
+        return
+
+    target = update.message.reply_to_message.from_user if update.message.reply_to_message else None
+    if not target:
+        await update.message.reply_text("❌ User ke message par reply karke /ban karo.")
+        return
+    if target.id == context.bot.id or target.is_bot:
+        await update.message.reply_text("❌ Bot ko ban nahi kar raha.")
+        return
+
+    await context.bot.ban_chat_member(update.effective_chat.id, target.id)
+    await update.message.reply_text(
+        f"🚫 <b>{esc(target.first_name)}</b> banned.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def unban_cmd(update, context):
+    ok, reason = await owner_group_mod_allowed(update, context, "can_ban_members")
+    if not ok:
+        await update.message.reply_text(reason)
+        return
+
+    if not context.args or not context.args[0].lstrip("-").isdigit():
+        await update.message.reply_text("Usage: /unban <user_id>")
+        return
+
+    uid = int(context.args[0])
+    await context.bot.unban_chat_member(
+        update.effective_chat.id, uid, only_if_banned=True
+    )
+    await update.message.reply_text(f"♻️ <code>{uid}</code> unbanned.", parse_mode=ParseMode.HTML)
+
+
+async def mute_cmd(update, context):
+    ok, reason = await owner_group_mod_allowed(update, context, "can_restrict_members")
+    if not ok:
+        await update.message.reply_text(reason)
+        return
+
+    target = update.message.reply_to_message.from_user if update.message.reply_to_message else None
+    if not target:
+        await update.message.reply_text("❌ User ke message par reply karke /mute <minutes> karo.")
+        return
+
+    minutes = 10
+    if context.args and context.args[0].isdigit():
+        minutes = max(1, min(int(context.args[0]), 1440))
+
+    until_date = datetime.now(timezone.utc) + timedelta(minutes=minutes)
+    await context.bot.restrict_chat_member(
+        update.effective_chat.id,
+        target.id,
+        permissions=ChatPermissions(can_send_messages=False),
+        until_date=until_date,
+    )
+    await update.message.reply_text(
+        f"🔇 <b>{esc(target.first_name)}</b> muted for {minutes} min.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def unmute_cmd(update, context):
+    ok, reason = await owner_group_mod_allowed(update, context, "can_restrict_members")
+    if not ok:
+        await update.message.reply_text(reason)
+        return
+
+    target = update.message.reply_to_message.from_user if update.message.reply_to_message else None
+    if not target:
+        await update.message.reply_text("❌ User ke message par reply karke /unmute karo.")
+        return
+
+    await context.bot.restrict_chat_member(
+        update.effective_chat.id,
+        target.id,
+        permissions=ChatPermissions(
+            can_send_messages=True,
+            can_send_audios=True,
+            can_send_documents=True,
+            can_send_photos=True,
+            can_send_videos=True,
+            can_send_video_notes=True,
+            can_send_voice_notes=True,
+            can_send_polls=True,
+            can_send_other_messages=True,
+            can_add_web_page_previews=True,
+        ),
+    )
+    await update.message.reply_text(
+        f"🔊 <b>{esc(target.first_name)}</b> unmuted.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def del_cmd(update, context):
+    ok, reason = await owner_group_mod_allowed(update, context, "can_delete_messages")
+    if not ok:
+        await update.message.reply_text(reason)
+        return
+
+    target_message = update.message.reply_to_message
+    if not target_message:
+        await update.message.reply_text("❌ Message par reply karke /del karo.")
+        return
+
+    await context.bot.delete_message(update.effective_chat.id, target_message.message_id)
+    await context.bot.delete_message(update.effective_chat.id, update.message.message_id)
+
+
+# Per-group in-memory spam counters.
+AUTOMOD_STATE = {}
+
+
+def has_link(text):
+    if not text:
+        return False
+    return bool(re.search(r"(https?://|www\.|t\.me/|telegram\.me/)", text, re.I))
+
+
+async def auto_moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or update.effective_chat.type not in ("group", "supergroup"):
+        return
+
+    chat = update.effective_chat
+    user = update.effective_user
+    if not user or user.is_bot:
+        return
+
+    if groups_coll is None or not group_is_authorized(chat.id):
+        return
+
+    data = get_automod(chat.id)
+    if not any(data.get(k) for k in ("auto_ban", "auto_mute", "anti_spam", "anti_link")):
+        return
+
+    # Never auto-moderate Telegram admins/creator.
+    try:
+        member = await context.bot.get_chat_member(chat.id, user.id)
+        if member.status in ("administrator", "creator"):
+            return
+    except Exception:
+        return
+
+    text = update.message.text or update.message.caption or ""
+
+    # Anti-link.
+    if data.get("anti_link") and has_link(text):
+        try:
+            if data.get("can_delete_messages", True):
+                await context.bot.delete_message(chat.id, update.message.message_id)
+        except Exception:
+            pass
+
+        if data.get("auto_ban"):
+            try:
+                await context.bot.ban_chat_member(chat.id, user.id)
+                return
+            except Exception:
+                pass
+
+        if data.get("auto_mute"):
+            try:
+                await context.bot.restrict_chat_member(
+                    chat.id, user.id,
+                    permissions=ChatPermissions(can_send_messages=False),
+                    until_date=datetime.now(timezone.utc) + timedelta(
+                        minutes=int(data.get("mute_minutes", 10))
+                    ),
+                )
+            except Exception:
+                pass
+        return
+
+    # Anti-spam.
+    if data.get("anti_spam"):
+        now = time.monotonic()
+        key = (chat.id, user.id)
+        bucket = AUTOMOD_STATE.setdefault(key, [])
+        window = int(data.get("spam_window", 10))
+        bucket[:] = [t for t in bucket if now - t <= window]
+        bucket.append(now)
+
+        if len(bucket) >= int(data.get("spam_limit", 5)):
+            bucket.clear()
+
+            if data.get("auto_ban"):
+                try:
+                    await context.bot.ban_chat_member(chat.id, user.id)
+                    return
+                except Exception:
+                    pass
+
+            if data.get("auto_mute"):
+                try:
+                    await context.bot.restrict_chat_member(
+                        chat.id, user.id,
+                        permissions=ChatPermissions(can_send_messages=False),
+                        until_date=datetime.now(timezone.utc) + timedelta(
+                            minutes=int(data.get("mute_minutes", 10))
+                        ),
+                    )
+                except Exception:
+                    pass
+
+
 # ===========================
 # /help — admin/owner ko sab commands, normal user ko sirf user commands
 # ===========================
@@ -2152,6 +2735,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/groups — Bot kin groups me added hai + authorization control",
             "/groupaccess &lt;group_id&gt; — Bot ke Telegram permissions dekho",
             "/broadcast &lt;message&gt; — Private subscribers ko broadcast",
+            "/ban /unban /mute /unmute /del — Owner-only group moderation",
         ]
 
     if is_owner(uid):
@@ -2238,7 +2822,22 @@ def main():
     app.add_handler(CallbackQueryHandler(group_control_callback, pattern=r"^groupcontrol:-?\d+$"))
     app.add_handler(CallbackQueryHandler(groups_back_callback, pattern=r"^groups:back$"))
 
+    app.add_handler(
+        CallbackQueryHandler(automod_callback, pattern=r"^automod:-?\d+$")
+    )
+    app.add_handler(
+        CallbackQueryHandler(automod_toggle_callback, pattern=r"^automodtoggle:(auto_ban|auto_mute|anti_spam|anti_link):-?\d+$")
+    )
+    app.add_handler(
+        CallbackQueryHandler(automod_num_callback, pattern=r"^automodnum:(spam_limit|spam_window|mute_minutes):-?\d+:-?\d+$")
+    )
+    app.add_handler(
+        CallbackQueryHandler(modhelp_callback, pattern=r"^modhelp:(ban|mute|unban|unmute|del):-?\d+$")
+    )
+
     # Existing callbacks remain unchanged.
+    app.add_handler(MessageHandler(filters.ALL, auto_moderate_message))
+
     app.add_handler(CallbackQueryHandler(callback_router))
 
     print("✅ RizzlerXEscrow Bot Running...")
