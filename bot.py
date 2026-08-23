@@ -14,6 +14,7 @@ from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
+    ChatMemberHandler,
     ContextTypes,
 )
 
@@ -49,6 +50,7 @@ coll = mongo_db["deals_rizzlerxescrow"] if mongo_db is not None else None
 meta_coll = mongo_db["meta_rizzlerxescrow"] if mongo_db is not None else None
 admins_coll = mongo_db["bot_admins_rizzlerxescrow"] if mongo_db is not None else None
 users_coll = mongo_db["broadcast_users_rizzlerxescrow"] if mongo_db is not None else None
+groups_coll = mongo_db["groups_rizzlerxescrow"] if mongo_db is not None else None
 
 DEALS = {}
 
@@ -86,6 +88,268 @@ def admin_only_allowed(update: Update):
     return is_admin(update.effective_user.id)
 
 
+# ===========================
+# GROUP CONTROL / AUTHORIZATION
+# ===========================
+
+def register_group(chat, bot_status=None):
+    """Bot jis group/supergroup me add hua hai uska record Mongo me rakho."""
+    if groups_coll is None or chat is None:
+        return
+
+    now = datetime.now(timezone.utc).isoformat()
+    existing = groups_coll.find_one({"_id": chat.id})
+
+    data = {
+        "title": chat.title or f"Chat {chat.id}",
+        "type": chat.type,
+        "username": getattr(chat, "username", None),
+        "updated_at": now,
+    }
+
+    if bot_status is not None:
+        data["bot_status"] = bot_status
+
+    if existing is None:
+        data["authorized"] = False
+        data["added_at"] = now
+
+    groups_coll.update_one(
+        {"_id": chat.id},
+        {"$set": data},
+        upsert=True,
+    )
+
+
+def group_is_authorized(chat_id):
+    if groups_coll is None:
+        return False
+    doc = groups_coll.find_one({"_id": chat_id})
+    return bool(doc and doc.get("authorized") is True)
+
+
+def group_control_allowed(update: Update):
+    """Authorized group me hi group-side bot features chalengi."""
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        return True, None
+
+    register_group(chat)
+
+    if groups_coll is None:
+        return False, "❌ Group authorization ke liye MongoDB required hai."
+
+    if not group_is_authorized(chat.id):
+        return False, (
+            "❌ Ye group abhi Owner ne authorize nahi kiya.\n"
+            "Owner private chat me /groups kholkar is group ko authorize kare."
+        )
+
+    return True, None
+
+
+async def bot_chat_member_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Bot add/remove/promote hone par group registry automatically update hoti hai."""
+    cm = update.my_chat_member
+    if not cm:
+        return
+
+    chat = cm.chat
+    if chat.type not in ("group", "supergroup"):
+        return
+
+    new_status = cm.new_chat_member.status
+    old_status = cm.old_chat_member.status
+
+    # Bot group me available hai -> register karo.
+    if new_status in ("member", "administrator", "creator"):
+        register_group(chat, bot_status=new_status)
+
+        # Pehli baar add hua ho to default unauthorized rahega.
+        # Existing authorized group ko re-add par bhi safe default ke liye
+        # dobara owner approval chahiye.
+        if groups_coll is not None and old_status in ("left", "kicked"):
+            groups_coll.update_one(
+                {"_id": chat.id},
+                {"$set": {
+                    "authorized": False,
+                    "reauthorized_required": True,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }},
+                upsert=True,
+            )
+    else:
+        # Bot removed/kicked: record delete nahi karte, /groups me history dikhegi.
+        register_group(chat, bot_status=new_status)
+        if groups_coll is not None:
+            groups_coll.update_one(
+                {"_id": chat.id},
+                {"$set": {
+                    "authorized": False,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }},
+            )
+
+
+async def group_admin_allowed(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Authorized group ka Telegram admin/creator check."""
+    ok, reason = group_control_allowed(update)
+    if not ok:
+        return False, reason
+
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        return False, None
+
+    try:
+        member = await context.bot.get_chat_member(
+            chat.id, update.effective_user.id
+        )
+    except Exception:
+        return False, "❌ Tumhara group-admin status check nahi ho paaya."
+
+    if member.status not in ("administrator", "creator"):
+        return False, None
+
+    return True, None
+
+
+def target_username_from_id(user_id):
+    """Known Mongo/user/deal records se username nikalo."""
+    if users_coll is not None:
+        doc = users_coll.find_one({"_id": user_id})
+        if doc and doc.get("username"):
+            return "@" + str(doc["username"]).lstrip("@")
+
+    if admins_coll is not None:
+        doc = admins_coll.find_one({"_id": user_id})
+        if doc and doc.get("username"):
+            return "@" + str(doc["username"]).lstrip("@")
+
+    for deal in DEALS.values():
+        if deal.get("created_by_id") == user_id or deal.get("escrowed_by_id") == user_id:
+            name = deal.get("escrowed_by")
+            if name and str(name).startswith("@"):
+                return str(name)
+
+    return None
+
+
+def normalize_target_username(value):
+    value = (value or "").strip()
+    if not value:
+        return None
+    return value if value.startswith("@") else "@" + value
+
+
+def find_user_target(context, update):
+    """
+    /stats target resolve:
+      /stats 123456789
+      /stats @username
+      /stats username
+      /stats (reply to user's message)
+    Returns: (user_id, username, first_name)
+    """
+    target_user = None
+    target_id = None
+    target_username = None
+
+    if update.message and update.message.reply_to_message:
+        target_user = update.message.reply_to_message.from_user
+        if target_user:
+            target_id = target_user.id
+            target_username = (
+                "@" + target_user.username if target_user.username else None
+            )
+
+    elif context.args:
+        raw = context.args[0].strip()
+        if raw.isdigit():
+            target_id = int(raw)
+        else:
+            target_username = normalize_target_username(raw)
+
+    else:
+        target_user = update.effective_user
+        target_id = target_user.id
+        target_username = (
+            "@" + target_user.username if target_user.username else None
+        )
+
+    first_name = None
+
+    if target_user:
+        first_name = target_user.first_name
+
+    if target_id is not None:
+        db_username = target_username_from_id(target_id)
+        if db_username:
+            target_username = db_username
+
+        if users_coll is not None:
+            doc = users_coll.find_one({"_id": target_id})
+            if doc:
+                first_name = first_name or doc.get("first_name")
+
+    if target_username and users_coll is not None:
+        uname = target_username.lstrip("@")
+        doc = users_coll.find_one({"username": uname})
+        if doc:
+            target_id = doc.get("_id")
+            first_name = first_name or doc.get("first_name")
+
+    if target_username:
+        target_username = normalize_target_username(target_username)
+
+    return target_id, target_username, first_name
+
+
+def status_for_target(user_id, username, first_name="User"):
+    """Kisi bhi user ka status, bina Update object ko mutate kiye."""
+    username = normalize_target_username(username) if username else None
+
+    mine = []
+    for tid, deal in DEALS.items():
+        if user_id is not None and (
+            deal.get("escrowed_by_id") == user_id
+            or deal.get("created_by_id") == user_id
+        ):
+            mine.append(deal)
+        elif username and deal.get("escrowed_by") == username:
+            mine.append(deal)
+
+    completed = [d for d in mine if d.get("status") == "COMPLETED"]
+    active = [d for d in mine if d.get("status") == "ACTIVE"]
+
+    totals = {"TON": 0.0, "USDT": 0.0, "INR": 0.0}
+    for d in completed:
+        cur = d.get("currency", "INR")
+        totals[cur] = totals.get(cur, 0.0) + float(d.get("amount", 0) or 0)
+
+    board = build_leaderboard(today_only=False)
+    rank_key = username or (f"id:{user_id}" if user_id is not None else "-")
+    rank = get_rank(rank_key, board, by="deals")
+
+    display = username or (f"ID {user_id}" if user_id is not None else "Unknown User")
+
+    return (
+        f"{pe('📈')} <b>{esc(first_name or display)} Deal status !</b>\n"
+        f"{pe('🆔')} User ➤ <code>{esc(display)}</code>\n"
+        "──────────────────\n"
+        f"{pe('🚀')} Rank ➤ #{rank}\n\n"
+        f"{pe('🔥')} Active deals ➤ {len(active)}\n\n"
+        f"{pe('✅')} Total Escrow's ➤ {len(completed)}\n\n"
+        f"{pe('⚡')} Total Volume :\n"
+        f"  {pe('🪙')} ➤ {totals['TON']:g} TON\n"
+        f"  {pe('💰')} ➤ {totals['USDT']:g} USDT\n"
+        f"  {pe('🤑')} ➤ {totals['INR']:g} ₹\n"
+        "──────────────────\n"
+        f"{pe('📱')} Escrow Bot for {BRAND}\n"
+        f"{pe('💤')} Provided by {PROVIDER} !"
+    )
+
+
 async def add_close_allowed(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /add aur /close ke liye permission check:
@@ -102,6 +366,11 @@ async def add_close_allowed(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     chat = update.effective_chat
     user_id = update.effective_user.id
+
+    if chat.type in ("group", "supergroup"):
+        group_ok, group_reason = await group_admin_allowed(update, context)
+        if not group_ok:
+            return False, group_reason
 
     if chat.type == "private":
         return is_admin(user_id), None
@@ -664,10 +933,51 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ===========================
 
 async def mystatus_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Har user apna khud ka status dekh sakta hai — group ho ya private, koi restriction nahi."""
+    """
+    /stats
+      - Normal user: apna status.
+      - Authorized group: sirf group admin kisi bhi user ka status dekh sakta hai.
+      - Private: bot-admin kisi bhi user ka status dekh sakta hai.
+    """
     remember_user(update)
+
+    # Target diya hai / reply kiya hai to elevated permission required.
+    has_target = bool(context.args) or bool(
+        update.message and update.message.reply_to_message
+    )
+
+    if update.effective_chat.type in ("group", "supergroup"):
+        if has_target:
+            allowed, reason = await group_admin_allowed(update, context)
+            if not allowed:
+                if reason and update.message:
+                    await update.message.reply_text(reason)
+                return
+        else:
+            allowed, reason = await group_control_allowed(update)
+            if not allowed:
+                if reason and update.message:
+                    await update.message.reply_text(reason)
+                return
+    else:
+        if has_target and not is_admin(update.effective_user.id):
+            return
+
+    user_id, username, first_name = find_user_target(context, update)
+
+    # User ne username diya aur wo known record me nahi mila, tab bhi
+    # username-based historical deals ka status dikh sakta hai.
+    if not user_id and not username:
+        await update.message.reply_text("❌ User ID/username resolve nahi ho paaya.")
+        return
+
+    if has_target:
+        text = status_for_target(user_id, username, first_name)
+    else:
+        text = my_status_text(update)
+
     await update.message.reply_text(
-        my_status_text(update),
+        text,
         parse_mode=ParseMode.HTML,
         reply_markup=status_kb(),
     )
@@ -752,6 +1062,7 @@ async def add(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "currency": currency_val,
         "status": "ACTIVE",
         "escrowed_by": creator_username,
+        "escrowed_by_id": update.effective_user.id,
         "created_by_id": update.effective_user.id,
         "chat_id": update.effective_chat.id,
         "exchange": is_exchange,
@@ -805,6 +1116,13 @@ async def hold_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     if not update.effective_user or not is_admin(update.effective_user.id):
         return
+
+    if update.effective_chat.type in ("group", "supergroup"):
+        group_ok, reason = await group_control_allowed(update)
+        if not group_ok:
+            if reason and update.message:
+                await update.message.reply_text(reason)
+            return
 
     # Only the owner can use this command, regardless of chat type.
     open_deals = [
@@ -1318,6 +1636,155 @@ async def admins_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # ===========================
+# /groups — OWNER ONLY
+# ===========================
+
+def groups_kb():
+    rows = []
+    if groups_coll is None:
+        return InlineKeyboardMarkup(rows)
+
+    docs = list(groups_coll.find({}).sort("title", 1))
+    for g in docs:
+        gid = g["_id"]
+        authorized = g.get("authorized") is True
+        title = g.get("title", f"Group {gid}")
+        label = "🟢" if authorized else "🔴"
+        action = "groupauth:off:" if authorized else "groupauth:on:"
+        rows.append([
+            InlineKeyboardButton(
+                f"{label} {title[:35]}",
+                callback_data=f"{action}{gid}",
+            )
+        ])
+    return InlineKeyboardMarkup(rows)
+
+
+async def groups_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != "private" or not is_owner(update.effective_user.id):
+        return
+
+    if groups_coll is None:
+        await update.message.reply_text("❌ MongoDB required for /groups.")
+        return
+
+    docs = list(groups_coll.find({}).sort("title", 1))
+    if not docs:
+        await update.message.reply_text(
+            "📭 Abhi bot ka koi group record nahi hai.\n\n"
+            "Bot ko kisi group me add karne ke baad /groups dobara check karo."
+        )
+        return
+
+    lines = [
+        f"{pe('👑')} <b>Bot Groups</b>",
+        "──────────────────",
+        "🟢 Authorized = bot group commands work karenge",
+        "🔴 Unauthorized = /add /close /stats target etc. blocked",
+        "",
+    ]
+
+    for i, g in enumerate(docs, start=1):
+        title = esc(g.get("title", f"Group {g['_id']}"))
+        gid = g["_id"]
+        status = "🟢 AUTHORIZED" if g.get("authorized") is True else "🔴 NOT AUTHORIZED"
+        bot_status = esc(g.get("bot_status", "unknown"))
+        username = g.get("username")
+        public = f" @{esc(username)}" if username else ""
+        lines.append(
+            f"<b>{i}. {title}</b>{public}\n"
+            f"   ID: <code>{gid}</code>\n"
+            f"   Status: {status}\n"
+            f"   Bot: <code>{bot_status}</code>"
+        )
+        lines.append("")
+
+    await update.message.reply_text(
+        "\n".join(lines),
+        parse_mode=ParseMode.HTML,
+        reply_markup=groups_kb(),
+        disable_web_page_preview=True,
+    )
+
+
+async def group_auth_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+
+    if not query.message or query.message.chat.type != "private":
+        await query.answer("Owner private chat me hi group control kar sakta hai.", show_alert=True)
+        return
+
+    if not is_owner(query.from_user.id):
+        await query.answer("❌ Sirf Owner.", show_alert=True)
+        return
+
+    if groups_coll is None:
+        await query.answer("MongoDB required.", show_alert=True)
+        return
+
+    try:
+        _, action, gid_text = query.data.split(":", 2)
+        gid = int(gid_text)
+    except Exception:
+        await query.answer("Invalid group.", show_alert=True)
+        return
+
+    group = groups_coll.find_one({"_id": gid})
+    if not group:
+        await query.answer("Group record nahi mila.", show_alert=True)
+        return
+
+    authorized = action == "on"
+    groups_coll.update_one(
+        {"_id": gid},
+        {"$set": {
+            "authorized": authorized,
+            "authorized_by": query.from_user.id,
+            "authorized_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "reauthorized_required": False,
+        }},
+    )
+
+    await query.answer(
+        "✅ Group authorized." if authorized else "🔴 Group unauthorized.",
+        show_alert=False,
+    )
+
+    # /groups screen refresh
+    docs = list(groups_coll.find({}).sort("title", 1))
+    lines = [
+        f"{pe('👑')} <b>Bot Groups</b>",
+        "──────────────────",
+        "🟢 Authorized = bot group commands work karenge",
+        "🔴 Unauthorized = group commands blocked",
+        "",
+    ]
+
+    for i, g in enumerate(docs, start=1):
+        title = esc(g.get("title", f"Group {g['_id']}"))
+        gid2 = g["_id"]
+        status = "🟢 AUTHORIZED" if g.get("authorized") is True else "🔴 NOT AUTHORIZED"
+        bot_status = esc(g.get("bot_status", "unknown"))
+        username = g.get("username")
+        public = f" @{esc(username)}" if username else ""
+        lines.append(
+            f"<b>{i}. {title}</b>{public}\n"
+            f"   ID: <code>{gid2}</code>\n"
+            f"   Status: {status}\n"
+            f"   Bot: <code>{bot_status}</code>"
+        )
+        lines.append("")
+
+    await query.edit_message_text(
+        "\n".join(lines),
+        parse_mode=ParseMode.HTML,
+        reply_markup=groups_kb(),
+        disable_web_page_preview=True,
+    )
+
+
+# ===========================
 # /help — admin/owner ko sab commands, normal user ko sirf user commands
 # ===========================
 
@@ -1342,6 +1809,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/leaderboard — Today + All-time top dealer/earner",
             "/deal &lt;DL-RIZZLER-N&gt; — Kisi bhi deal ki full detail dekho",
             "/admins — Bot admins ki list dekho",
+            "/groups — Bot kin groups me added hai + authorization control",
             "/broadcast &lt;message&gt; — Private subscribers ko broadcast",
         ]
 
@@ -1397,6 +1865,7 @@ def main():
 
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("stats", mystatus_cmd))
+    app.add_handler(CommandHandler("groups", groups_cmd))
     app.add_handler(CommandHandler("add", add))
     app.add_handler(CommandHandler("close", close))
     app.add_handler(CommandHandler("hold", hold_cmd))
@@ -1408,6 +1877,18 @@ def main():
     app.add_handler(CommandHandler("removeadmin", removeadmin_cmd))
     app.add_handler(CommandHandler("admins", admins_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
+
+    # Telegram bot add/remove/promote events -> group registry.
+    app.add_handler(
+        ChatMemberHandler(bot_chat_member_update, ChatMemberHandler.MY_CHAT_MEMBER)
+    )
+
+    # Owner's /groups authorize/revoke buttons.
+    app.add_handler(
+        CallbackQueryHandler(group_auth_callback, pattern=r"^groupauth:(on|off):")
+    )
+
+    # Existing callbacks remain unchanged.
     app.add_handler(CallbackQueryHandler(callback_router))
 
     print("✅ RizzlerXEscrow Bot Running...")
