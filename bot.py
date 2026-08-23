@@ -1712,6 +1712,58 @@ async def del_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
+
+# ===========================
+# BOT CHAT MEMBER UPDATE
+# ===========================
+
+async def bot_chat_member_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Track when the bot is added/removed from a group.
+
+    This is intentionally lightweight: group authorization is still controlled
+    by the Owner through /groups, so simply adding the bot never grants access.
+    """
+    try:
+        cmu = update.my_chat_member
+        if not cmu:
+            return
+
+        chat = cmu.chat
+        new_member = cmu.new_chat_member
+
+        if chat.type not in ("group", "supergroup"):
+            return
+
+        if groups_coll is None:
+            return
+
+        is_present = new_member.status in ("member", "administrator", "creator")
+        is_admin = new_member.status in ("administrator", "creator")
+
+        groups_coll.update_one(
+            {"_id": chat.id},
+            {
+                "$set": {
+                    "title": chat.title or str(chat.id),
+                    "username": getattr(chat, "username", None),
+                    "bot_status": new_member.status,
+                    "bot_is_admin": is_admin,
+                    "bot_present": is_present,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                },
+                "$setOnInsert": {
+                    "authorized": False,
+                    "added_at": datetime.now(timezone.utc).isoformat(),
+                },
+            },
+            upsert=True,
+        )
+
+        ensure_group_runtime(chat.id)
+
+    except Exception as exc:
+        print(f"⚠️ bot_chat_member_update error: {exc}")
+
 # ===========================
 # OWNER GROUP CONTROL PANEL
 # ===========================
@@ -2052,122 +2104,38 @@ async def automod_num_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 # ===========================
-# ROBUST /stats ROUTER
+# /stats ROUTER
 # ===========================
 
 async def mystatus_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Keep existing stats rendering, but correctly resolve group targets."""
+    """Exact behavior:
+    - /stats => command sender's stats
+    - reply + /stats => replied user's stats
+    - group target by username/user_id is intentionally not used
+    """
     if not update.message:
         return
 
     chat = update.effective_chat
-    user = update.effective_user
+    command_user = update.effective_user
 
-    # In groups, all stats access is restricted to authorized groups.
     if chat.type in ("group", "supergroup"):
         ok, reason = await group_control_allowed(update)
         if not ok:
             await update.message.reply_text(reason)
             return
 
-    target = user
-
-    # Reply target: /stats used as a reply to a user's message.
+    # If /stats is a reply, show the replied user's stats.
     if update.message.reply_to_message and update.message.reply_to_message.from_user:
         target = update.message.reply_to_message.from_user
+    else:
+        # Plain /stats always means the command sender.
+        target = command_user
 
-    # Explicit target: /stats <user_id> or /stats @username
-    elif context.args:
-        raw = context.args[0].strip()
-
-        if raw.lstrip("-").isdigit():
-            uid = int(raw)
-            try:
-                member = await context.bot.get_chat_member(chat.id, uid)
-                target = member.user
-            except Exception:
-                # For private chat, fall back to local user/deal records.
-                target = None
-                if users_coll is not None:
-                    doc = users_coll.find_one({
-                        "$or": [
-                            {"user_id": uid},
-                            {"_id": uid},
-                            {"telegram_id": uid},
-                        ]
-                    })
-                    if doc:
-                        class _U:
-                            pass
-                        target = _U()
-                        target.id = uid
-                        target.username = doc.get("username")
-                        target.first_name = doc.get("first_name") or doc.get("name") or str(uid)
-                        target.last_name = doc.get("last_name")
-                        target.is_bot = False
-                if target is None:
-                    await update.message.reply_text("❌ User group me nahi mila.")
-                    return
-
-        else:
-            username = raw.lstrip("@").lower()
-            found = None
-
-            # Telegram cannot reliably resolve arbitrary usernames through Bot API,
-            # so first try current chat members where possible, then local DB.
-            if chat.type in ("group", "supergroup"):
-                try:
-                    # get_chat_member needs ID, not username; use local records below.
-                    pass
-                except Exception:
-                    pass
-
-            if users_coll is not None:
-                found = users_coll.find_one({
-                    "$or": [
-                        {"username": username},
-                        {"username": f"@{username}"},
-                        {"telegram_username": username},
-                        {"telegram_username": f"@{username}"},
-                    ]
-                })
-
-            if found:
-                class _U:
-                    pass
-                target = _U()
-                target.id = found.get("user_id") or found.get("_id") or found.get("telegram_id")
-                target.username = found.get("username") or username
-                target.first_name = found.get("first_name") or found.get("name") or username
-                target.last_name = found.get("last_name")
-                target.is_bot = False
-            else:
-                await update.message.reply_text(
-                    "❌ @username database me nahi mila. "
-                    "User ke message par reply karke /stats use karo."
-                )
-                return
-
-    # Group: non-admin can only see own stats. Admin/owner can inspect another user.
-    if chat.type in ("group", "supergroup") and target.id != user.id:
-        allowed = is_owner(user.id)
-        if not allowed:
-            try:
-                member = await context.bot.get_chat_member(chat.id, user.id)
-                allowed = member.status in ("administrator", "creator")
-            except Exception:
-                allowed = False
-        if not allowed:
-            await update.message.reply_text("❌ Sirf group admin/owner kisi aur user ka /stats dekh sakta hai.")
-            return
-
-    # Reuse the original rendering implementation by temporarily invoking it
-    # with the target encoded in context.
+    # Preserve the existing stats renderer.
     context.user_data["_stats_target_user"] = target
 
-    # The legacy function may use update.effective_user. We replace that reference
-    # only within a lightweight proxy update.
-    class _ProxyUpdate:
+    class _StatsProxy:
         def __init__(self, original, target_user):
             self._original = original
             self.effective_user = target_user
@@ -2176,7 +2144,7 @@ async def mystatus_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             self.callback_query = original.callback_query
 
     try:
-        await _legacy_mystatus_cmd(_ProxyUpdate(update, target), context)
+        await _legacy_mystatus_cmd(_StatsProxy(update, target), context)
     finally:
         context.user_data.pop("_stats_target_user", None)
 
