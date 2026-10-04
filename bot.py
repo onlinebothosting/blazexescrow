@@ -74,11 +74,11 @@ def log_event(scope, message, level=logging.INFO, *args):
 # ===========================
 # Config (.env se aata hai)
 # ===========================
-# RIZZLER_BOT_TOKEN=xxxx
+# BLAZE_BOT_TOKEN=xxxx
 # MONGO_URI=xxxx
 # ADMIN_IDS=123,456   -> ye "OWNERS" hai, sirf ye naye bot-admin add/remove kar sakte hai
 
-BOT_TOKEN = os.getenv("RIZZLER_BOT_TOKEN")
+BOT_TOKEN = os.getenv("BLAZE_BOT_TOKEN")
 BRAND = "BLAZEXESCROWSERVICE"
 PROVIDER = "BLAZEXESCROWSERVICE"
 TRADE_PREFIX = "DL-BLAZE"  # New deals: DL-BLAZE-1, DL-BLAZE-2, ...
@@ -311,7 +311,7 @@ def group_is_authorized(chat_id):
 
 
 # ===========================
-# Sequential Trade ID: DL-RIZZLER-1, DL-RIZZLER-2, ...
+# Sequential Trade ID: DL-BLAZE-1, DL-BLAZE-2, ...
 # ===========================
 
 def next_trade_id():
@@ -1197,13 +1197,13 @@ async def close(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Support both old stored deals and the new DL-BLAZE format.
     match = re.search(
-        r"Trade ID\s*:</?[^>]*>\s*(?:<code>)?((?:DL-BLAZE|DL-RIZZLER)-\d+)",
+        r"Trade ID\s*:</?[^>]*>\s*(?:<code>)?((?:DL-BLAZE|DL-BLAZE)-\d+)",
         reply_text,
         re.IGNORECASE,
     )
     if not match:
         match = re.search(
-            r"Trade ID\s*:\s*(DL-(?:BLAZE|RIZZLER)-\d+)",
+            r"Trade ID\s*:\s*(DL-(?:BLAZE|BLAZE)-\d+)",
             reply_text,
             re.IGNORECASE,
         )
@@ -2773,7 +2773,7 @@ def main():
         asyncio.set_event_loop(asyncio.new_event_loop())
 
     if not BOT_TOKEN:
-        raise RuntimeError("RIZZLER_BOT_TOKEN is missing from Render environment variables")
+        raise RuntimeError("BLAZE_BOT_TOKEN is missing from Render environment variables")
 
     app = Application.builder().token(BOT_TOKEN).build()
     log_event("BOOT", "python-telegram-bot application created")
