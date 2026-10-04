@@ -97,13 +97,13 @@ ADMIN_ALIASES = {
 }
 
 mongo_client = MongoClient(MONGO_URI) if MONGO_URI else None
-mongo_db = mongo_client["escrow_bots"] if mongo_client else None
-coll = mongo_db["deals_blazexescrow"] if mongo_db is not None else None
-meta_coll = mongo_db["meta_blazexescrow"] if mongo_db is not None else None
-admins_coll = mongo_db["bot_admins_blazexescrow"] if mongo_db is not None else None
-users_coll = mongo_db["broadcast_users_blazexescrow"] if mongo_db is not None else None
-groups_coll = mongo_db["groups_blazexescrow"] if mongo_db is not None else None
-automod_coll = mongo_db["group_automod_blazexescrow"] if mongo_db is not None else None
+mongo_db = mongo_client["blaze_escrow"] if mongo_client else None
+coll = mongo_db["deals"] if mongo_db is not None else None
+meta_coll = mongo_db["meta"] if mongo_db is not None else None
+admins_coll = mongo_db["admins"] if mongo_db is not None else None
+users_coll = mongo_db["broadcast_users"] if mongo_db is not None else None
+groups_coll = mongo_db["groups"] if mongo_db is not None else None
+automod_coll = mongo_db["group_automod"] if mongo_db is not None else None
 
 DEALS = {}
 
@@ -1159,13 +1159,40 @@ async def hold_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # /close
 # ===========================
 
-async def close(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Close a deal only from a reply to the deal message.
+# Temporary in-memory album cache. Telegram albums arrive as separate photo
+# messages sharing the same media_group_id. We keep only Telegram file_ids;
+# nothing is downloaded to disk and nothing is forwarded.
+CLOSE_ALBUMS = {}
 
-    SECURITY RULE: a payment screenshot/photo MUST be attached to the
-    /close command. Without the screenshot the deal is never closed.
-    """
+
+async def collect_close_album_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Collect photos belonging to a /close payment-proof album."""
+    message = update.message
+    if not message or not message.photo or not message.media_group_id:
+        return
+
+    caption = (message.caption or "").strip()
+    is_close_caption = bool(re.match(r"^\s*/close(?:@\w+)?(?:\s|$)", caption, re.IGNORECASE))
+    is_reply = bool(message.reply_to_message)
+
+    # Only remember photos that could belong to the close flow. This avoids
+    # storing unrelated group albums forever.
+    if not (is_close_caption or is_reply):
+        return
+
+    key = (message.chat_id, message.media_group_id)
+    bucket = CLOSE_ALBUMS.setdefault(key, {})
+    bucket[message.message_id] = {
+        "file_id": message.photo[-1].file_id,
+        "unique_id": getattr(message.photo[-1], "file_unique_id", None),
+        "message_id": message.message_id,
+        "reply_message_id": getattr(message.reply_to_message, "message_id", None),
+        "caption": caption,
+    }
+
+
+async def _process_close(update: Update, context: ContextTypes.DEFAULT_TYPE, payment_file_ids=None):
+    """Actual close implementation. payment_file_ids are Telegram file_ids."""
     allowed, reason = await add_close_allowed(update, context)
     if not allowed:
         if reason and update.message:
@@ -1184,8 +1211,8 @@ async def close(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Payment proof is mandatory. Only Telegram photo/screenshot is accepted.
-    if not message.photo:
+    # Payment proof is mandatory.
+    if not message.photo and not payment_file_ids:
         await message.reply_text(
             "❌ Payment screenshot required hai.\n\n"
             "📸 Original deal par reply karo + payment screenshot attach karo + caption me /close likho.\n"
@@ -1195,37 +1222,26 @@ async def close(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     reply_text = message.reply_to_message.text or message.reply_to_message.caption or ""
 
-    # Support both old stored deals and the new DL-BLAZE format.
     match = re.search(
-        r"Trade ID\s*:</?[^>]*>\s*(?:<code>)?((?:DL-BLAZE|DL-BLAZE)-\d+)",
+        r"Trade ID\s*:</?[^>]*>\s*(?:<code>)?(DL-BLAZE-\d+)",
         reply_text,
         re.IGNORECASE,
     )
     if not match:
-        match = re.search(
-            r"Trade ID\s*:\s*(DL-(?:BLAZE|BLAZE)-\d+)",
-            reply_text,
-            re.IGNORECASE,
-        )
+        match = re.search(r"Trade ID\s*:\s*(DL-BLAZE-\d+)", reply_text, re.IGNORECASE)
 
     if not match:
-        await message.reply_text(
-            "❌ Reply kiye gaye message me valid Trade ID nahi mila."
-        )
+        await message.reply_text("❌ Reply kiye gaye message me valid Trade ID nahi mila.")
         return
 
     tid = match.group(1).upper()
 
-    # Optional release amount / cancel is allowed after /close, but screenshot
-    # remains mandatory in every case.
-    # IMPORTANT: when /close is written in a PHOTO CAPTION, Telegram sends it
-    # as caption text, not as a normal CommandHandler update, so context.args
-    # is empty. Parse the caption explicitly.
+    # Parse /close amount/cancel from either a normal command or photo caption.
     released_amount_arg = context.args[0] if context.args else None
-    if message.photo:
-        caption = (message.caption or '').strip()
+    caption = (message.caption or "").strip()
+    if message.photo and caption:
         caption_match = re.match(
-            r'^\s*/close(?:@\w+)?(?:\s+([^\s]+))?\s*$',
+            r"^\s*/close(?:@\w+)?(?:\s+([^\s]+))?\s*$",
             caption,
             re.IGNORECASE,
         )
@@ -1247,14 +1263,10 @@ async def close(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(closer_id):
         if deal_creator_id is not None:
             if closer_id != deal_creator_id:
-                await message.reply_text(
-                    "❌ Tum sirf apni create ki hui deal close kar sakte ho."
-                )
+                await message.reply_text("❌ Tum sirf apni create ki hui deal close kar sakte ho.")
                 return
         elif resolve_username(update) != deal.get("escrowed_by"):
-            await message.reply_text(
-                "❌ Tum sirf apni create ki hui deal close kar sakte ho."
-            )
+            await message.reply_text("❌ Tum sirf apni create ki hui deal close kar sakte ho.")
             return
 
     if deal.get("status") == "HOLD":
@@ -1262,9 +1274,7 @@ async def close(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if deal.get("status") != "ACTIVE":
-        await message.reply_text(
-            f"❌ Yeh deal already {deal.get('status', 'closed')} hai."
-        )
+        await message.reply_text(f"❌ Yeh deal already {deal.get('status', 'closed')} hai.")
         return
 
     is_cancel = bool(released_amount_arg and released_amount_arg.lower() == "cancel")
@@ -1277,12 +1287,18 @@ async def close(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         released_val = deal.get("release", 0.0)
 
-    # Save payment proof file_id permanently with the deal.
-    payment_photo = message.photo[-1]
-    deal["payment_proof_file_id"] = payment_photo.file_id
-    deal["payment_proof_unique_id"] = getattr(payment_photo, "file_unique_id", None)
+    # Build a unique, ordered list of Telegram file_ids. These are Telegram's
+    # own stored files: no download/re-upload and no "Forwarded from" label.
+    if payment_file_ids:
+        proof_ids = list(dict.fromkeys(payment_file_ids))
+    else:
+        proof_ids = [message.photo[-1].file_id]
+
+    deal["payment_proof_file_ids"] = proof_ids
+    deal["payment_proof_file_id"] = proof_ids[0] if proof_ids else None
     deal["payment_proof_uploaded_by_id"] = closer_id
     deal["payment_proof_uploaded_at"] = datetime.now(timezone.utc).isoformat()
+    deal["payment_proof_count"] = len(proof_ids)
 
     deal["status"] = "CANCELLED" if is_cancel else "COMPLETED"
     deal["released"] = released_val
@@ -1310,7 +1326,25 @@ async def close(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"{fmt(released_val, currency_val)} smooth escrow deal</code>\n"
         )
 
-    # Owner-selected image is immutable to admins and is only configurable by owner.
+    # 1) Send EVERY payment-proof image supplied with /close using Telegram's
+    # stored file_id. This is not a forwarded message and nothing is downloaded.
+    # They appear as normal bot-sent photos with no "Forwarded from" label.
+    sent_any_proof = False
+    if not is_cancel:
+        for file_id in proof_ids:
+            try:
+                await context.bot.send_photo(
+                    chat_id=message.chat_id,
+                    photo=file_id,
+                )
+                sent_any_proof = True
+            except (BadRequest, TelegramError):
+                continue
+
+    # 2) Owner-selected Blaze completion image is the actual "Deal Completed"
+    # card. It is owner-only configurable and the completion details are placed
+    # underneath it as the photo caption. If no owner image is configured, the
+    # first payment-proof image gets the completion caption instead.
     close_image_id = get_close_image_id()
     if close_image_id and not is_cancel:
         try:
@@ -1320,17 +1354,47 @@ async def close(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 caption=msg,
                 parse_mode=ParseMode.HTML,
             )
+            sent_any_proof = True
         except (BadRequest, TelegramError):
-            # If Telegram rejects the stored file_id, fall back to text and keep
-            # the deal closed rather than failing the whole close operation.
-            await message.reply_text(msg, parse_mode=ParseMode.HTML)
-    else:
+            pass
+    elif proof_ids and not is_cancel:
+        # We already sent the proof image(s). Send the details as a normal text
+        # fallback when the owner has not selected a completion image.
+        await message.reply_text(msg, parse_mode=ParseMode.HTML)
+        sent_any_proof = True
+
+    # Cancelled deals still get the completion text; no payment proof is
+    # duplicated as a completion image.
+    if is_cancel or not sent_any_proof:
         await message.reply_text(msg, parse_mode=ParseMode.HTML)
 
+    # Remove the command/proof message after processing, as before.
     try:
         await message.delete()
     except Exception:
         pass
+
+
+async def close(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Close a Blaze deal with a payment screenshot, including photo albums."""
+    message = update.message
+    if not message:
+        return
+
+    payment_file_ids = None
+    if message.media_group_id:
+        # Give the rest of the Telegram album a moment to arrive. All photos
+        # are already stored as Telegram file_ids by collect_close_album_photo.
+        await asyncio.sleep(1.0)
+        key = (message.chat_id, message.media_group_id)
+        bucket = CLOSE_ALBUMS.pop(key, {})
+        payment_file_ids = [
+            item["file_id"]
+            for item in sorted(bucket.values(), key=lambda x: x["message_id"])
+            if item.get("file_id")
+        ]
+
+    await _process_close(update, context, payment_file_ids=payment_file_ids)
 
 
 # ===========================
@@ -2728,7 +2792,7 @@ def start_dummy_server():
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
-            body = b"blazexescrow bot is running"
+            body = b"BLAZEXESCROWSERVICE bot is running"
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
@@ -2802,6 +2866,13 @@ def main():
     app.add_handler(CommandHandler("add", add))
     app.add_handler(CommandHandler("close", close))
 
+    # Collect all photos in a Telegram payment-proof album by file_id.
+    # This does not download or forward anything.
+    app.add_handler(
+        MessageHandler(filters.PHOTO, collect_close_album_photo),
+        group=-20,
+    )
+
     # Telegram does NOT route /close written in a photo caption through
     # CommandHandler. This handler is therefore required for the intended
     # flow: reply to the deal + attach payment screenshot + caption /close.
@@ -2871,7 +2942,7 @@ def main():
     app.add_handler(CallbackQueryHandler(callback_router))
     app.add_error_handler(global_error_handler)
 
-    log_event("BOOT", "blazexescrow Bot starting polling")
+    log_event("BOOT", "BLAZEXESCROWSERVICE Bot starting polling")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
