@@ -84,7 +84,11 @@ PROVIDER = "BLAZEXESCROWSERVICE"
 TRADE_PREFIX = "DL-BLAZE"  # New deals: DL-BLAZE-1, DL-BLAZE-2, ...
 
 MONGO_URI = os.getenv("MONGO_URI")
-OWNER_IDS = set(
+# Primary Blaze owner is always hidden from public /admins output.
+# Additional owner IDs can still be supplied through ADMIN_IDS.
+PRIMARY_OWNER_ID = 8256108006
+OWNER_IDS = {PRIMARY_OWNER_ID}
+OWNER_IDS.update(
     int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()
 )
 
@@ -1326,42 +1330,60 @@ async def _process_close(update: Update, context: ContextTypes.DEFAULT_TYPE, pay
             f"{fmt(released_val, currency_val)} smooth escrow deal</code>\n"
         )
 
-    # 1) Send EVERY payment-proof image supplied with /close using Telegram's
-    # stored file_id. This is not a forwarded message and nothing is downloaded.
-    # They appear as normal bot-sent photos with no "Forwarded from" label.
+    # 1) The completion card is ALWAYS a normal bot-sent photo with the text
+    # attached as its Telegram caption. No forwarding and no downloading.
+    # The owner-selected Blaze image is preferred. If the owner has not set one,
+    # reuse the FIRST payment-proof image itself as the completion card.
     sent_any_proof = False
+    close_image_id = get_close_image_id()
+
     if not is_cancel:
-        for file_id in proof_ids:
+        if close_image_id:
             try:
                 await context.bot.send_photo(
                     chat_id=message.chat_id,
-                    photo=file_id,
+                    photo=close_image_id,
+                    caption=msg,
+                    parse_mode=ParseMode.HTML,
                 )
                 sent_any_proof = True
             except (BadRequest, TelegramError):
-                continue
+                close_image_id = None
 
-    # 2) Owner-selected Blaze completion image is the actual "Deal Completed"
-    # card. It is owner-only configurable and the completion details are placed
-    # underneath it as the photo caption. If no owner image is configured, the
-    # first payment-proof image gets the completion caption instead.
-    close_image_id = get_close_image_id()
-    if close_image_id and not is_cancel:
-        try:
-            await context.bot.send_photo(
-                chat_id=message.chat_id,
-                photo=close_image_id,
-                caption=msg,
-                parse_mode=ParseMode.HTML,
-            )
-            sent_any_proof = True
-        except (BadRequest, TelegramError):
-            pass
-    elif proof_ids and not is_cancel:
-        # We already sent the proof image(s). Send the details as a normal text
-        # fallback when the owner has not selected a completion image.
-        await message.reply_text(msg, parse_mode=ParseMode.HTML)
-        sent_any_proof = True
+        # If no owner image is configured (or it failed), attach the completion
+        # text directly to the first payment screenshot. Remaining screenshots
+        # are sent normally, all from Telegram file_id (never forwarded).
+        if not close_image_id and proof_ids:
+            first = True
+            for file_id in proof_ids:
+                try:
+                    if first:
+                        await context.bot.send_photo(
+                            chat_id=message.chat_id,
+                            photo=file_id,
+                            caption=msg,
+                            parse_mode=ParseMode.HTML,
+                        )
+                        first = False
+                    else:
+                        await context.bot.send_photo(
+                            chat_id=message.chat_id,
+                            photo=file_id,
+                        )
+                    sent_any_proof = True
+                except (BadRequest, TelegramError):
+                    continue
+        elif close_image_id:
+            # Payment screenshots still need to be shown after the completion
+            # card when an owner image is configured.
+            for file_id in proof_ids:
+                try:
+                    await context.bot.send_photo(
+                        chat_id=message.chat_id,
+                        photo=file_id,
+                    )
+                except (BadRequest, TelegramError):
+                    continue
 
     # Cancelled deals still get the completion text; no payment proof is
     # duplicated as a completion image.
@@ -1546,24 +1568,12 @@ async def admins_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not admin_only_allowed(update):
         return
 
-    lines = [f"{pe('👑')} <b>Owners</b>"]
-
-    # ==========================
-    # OWNERS
-    # ==========================
-    if not OWNER_IDS:
-        lines.append("  (koi owner set nahi hai)")
-    else:
-        for uid in sorted(OWNER_IDS):
-            lines.append(
-                f'  • <a href="tg://user?id={uid}">Owner</a> '
-                f'<code>({uid})</code>'
-            )
-
-    # Extra admins
+    # Owners are intentionally NOT listed here.
+    # They remain fully privileged through is_owner()/is_admin(), but their
+    # Telegram IDs must never be exposed through /admins.
     extra_admins = BOT_ADMINS - OWNER_IDS
 
-    lines.append(f"\n{pe('🛡')} <b>Bot Admins</b>")
+    lines = [f"{pe('🛡')} <b>Bot Admins</b>"]
 
     if not extra_admins:
         lines.append("  (koi extra admin nahi hai)")
