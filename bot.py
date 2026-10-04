@@ -458,18 +458,22 @@ def pe(emoji):
 # ===========================
 
 def calculate_fee(amount, is_exchange=False):
-    if is_exchange:
-        return amount * 0.025
-    if amount < 200:
-        return 10.0
-    elif amount <= 500:
-        return 20.0
-    elif amount <= 2000:
-        return amount * 0.04
-    elif amount <= 3000:
-        return amount * 0.035
-    else:
-        return amount * 0.03
+    # TEMPORARY: All fees disabled
+    return 0.0
+
+    # OLD FEE SYSTEM:
+    # if is_exchange:
+    #     return amount * 0.025
+    # if amount < 200:
+    #     return 10.0
+    # elif amount <= 500:
+    #     return 20.0
+    # elif amount <= 2000:
+    #     return amount * 0.04
+    # elif amount <= 3000:
+    #     return amount * 0.035
+    # else:
+    #     return amount * 0.03
 
 
 # ===========================
