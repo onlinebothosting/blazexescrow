@@ -79,8 +79,8 @@ def log_event(scope, message, level=logging.INFO, *args):
 # ADMIN_IDS=123,456   -> ye "OWNERS" hai, sirf ye naye bot-admin add/remove kar sakte hai
 
 BOT_TOKEN = os.getenv("BLAZE_BOT_TOKEN")
-BRAND = "@BLAZEXESCROWSERVICE"
-PROVIDER = "@BLAZEXESCROWSERVICE"
+BRAND = "BLAZEXESCROWSERVICE"
+PROVIDER = "BLAZEXESCROWSERVICE"
 TRADE_PREFIX = "DL-BLAZE"  # New deals: DL-BLAZE-1, DL-BLAZE-2, ...
 
 MONGO_URI = os.getenv("MONGO_URI")
@@ -97,7 +97,7 @@ ADMIN_ALIASES = {
 }
 
 mongo_client = MongoClient(MONGO_URI) if MONGO_URI else None
-mongo_db = mongo_client["blaze_escrow_bots"] if mongo_client else None
+mongo_db = mongo_client["escrow_bots"] if mongo_client else None
 coll = mongo_db["deals_blazexescrow"] if mongo_db is not None else None
 meta_coll = mongo_db["meta_blazexescrow"] if mongo_db is not None else None
 admins_coll = mongo_db["bot_admins_blazexescrow"] if mongo_db is not None else None
@@ -1218,7 +1218,19 @@ async def close(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Optional release amount / cancel is allowed after /close, but screenshot
     # remains mandatory in every case.
+    # IMPORTANT: when /close is written in a PHOTO CAPTION, Telegram sends it
+    # as caption text, not as a normal CommandHandler update, so context.args
+    # is empty. Parse the caption explicitly.
     released_amount_arg = context.args[0] if context.args else None
+    if message.photo:
+        caption = (message.caption or '').strip()
+        caption_match = re.match(
+            r'^\s*/close(?:@\w+)?(?:\s+([^\s]+))?\s*$',
+            caption,
+            re.IGNORECASE,
+        )
+        if caption_match:
+            released_amount_arg = caption_match.group(1)
 
     deal = DEALS.get(tid)
     if not deal:
@@ -2789,6 +2801,17 @@ def main():
     app.add_handler(CommandHandler("del", del_cmd))
     app.add_handler(CommandHandler("add", add))
     app.add_handler(CommandHandler("close", close))
+
+    # Telegram does NOT route /close written in a photo caption through
+    # CommandHandler. This handler is therefore required for the intended
+    # flow: reply to the deal + attach payment screenshot + caption /close.
+    app.add_handler(
+        MessageHandler(
+            filters.PHOTO & filters.CaptionRegex(r"^\s*/close(?:@\w+)?(?:\s|$)"),
+            close,
+        )
+    )
+
     app.add_handler(CommandHandler("setcloseimage", setcloseimage_cmd))
     app.add_handler(CommandHandler("removecloseimage", removecloseimage_cmd))
     app.add_handler(CommandHandler("hold", hold_cmd))
