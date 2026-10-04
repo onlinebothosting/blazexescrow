@@ -414,7 +414,7 @@ def normalize_bold(text):
 #
 # Neeche di gayi IDs me se check / trade / escrow verify ho chuki hain (working).
 PE = {
-    "⭐️": "5181422544162391976",
+    "⭐️": "5050843585470006824",
     "❤️": "5260535596941582167",
     "💬": "5258330865674494479",
     "🍑": "5323761960829862762",
