@@ -59,7 +59,7 @@ def setup_logging():
 
 
 setup_logging()
-logger = logging.getLogger("rizzlerxescrow")
+logger = logging.getLogger("blazexescrow")
 
 
 def log_event(scope, message, level=logging.INFO, *args):
@@ -79,8 +79,9 @@ def log_event(scope, message, level=logging.INFO, *args):
 # ADMIN_IDS=123,456   -> ye "OWNERS" hai, sirf ye naye bot-admin add/remove kar sakte hai
 
 BOT_TOKEN = os.getenv("RIZZLER_BOT_TOKEN")
-BRAND = "@rizzlerxescrow"
-PROVIDER = "@rizzlerxescrow"
+BRAND = "BLAZEXESCROWSERVICE"
+PROVIDER = "BLAZEXESCROWSERVICE"
+TRADE_PREFIX = "DL-BLAZE"  # New deals: DL-BLAZE-1, DL-BLAZE-2, ...
 
 MONGO_URI = os.getenv("MONGO_URI")
 OWNER_IDS = set(
@@ -96,13 +97,13 @@ ADMIN_ALIASES = {
 }
 
 mongo_client = MongoClient(MONGO_URI) if MONGO_URI else None
-mongo_db = mongo_client["escrow_bots"] if mongo_client else None
-coll = mongo_db["deals_rizzlerxescrow"] if mongo_db is not None else None
-meta_coll = mongo_db["meta_rizzlerxescrow"] if mongo_db is not None else None
-admins_coll = mongo_db["bot_admins_rizzlerxescrow"] if mongo_db is not None else None
-users_coll = mongo_db["broadcast_users_rizzlerxescrow"] if mongo_db is not None else None
-groups_coll = mongo_db["groups_rizzlerxescrow"] if mongo_db is not None else None
-automod_coll = mongo_db["group_automod_rizzlerxescrow"] if mongo_db is not None else None
+mongo_db = mongo_client["blaze_escrow_bots"] if mongo_client else None
+coll = mongo_db["deals_blazexescrow"] if mongo_db is not None else None
+meta_coll = mongo_db["meta_blazexescrow"] if mongo_db is not None else None
+admins_coll = mongo_db["bot_admins_blazexescrow"] if mongo_db is not None else None
+users_coll = mongo_db["broadcast_users_blazexescrow"] if mongo_db is not None else None
+groups_coll = mongo_db["groups_blazexescrow"] if mongo_db is not None else None
+automod_coll = mongo_db["group_automod_blazexescrow"] if mongo_db is not None else None
 
 DEALS = {}
 
@@ -314,6 +315,7 @@ def group_is_authorized(chat_id):
 # ===========================
 
 def next_trade_id():
+    """Generate new sequential Trade IDs in the DL-BLAZE-N format."""
     if meta_coll is not None:
         doc = meta_coll.find_one_and_update(
             {"_id": "trade_counter"},
@@ -321,14 +323,14 @@ def next_trade_id():
             upsert=True,
             return_document=ReturnDocument.AFTER,
         )
-        seq = doc["seq"]
+        seq = int(doc.get("seq", 1))
     else:
         seq = len(DEALS) + 1
 
-    tid = f"DL-RIZZLER-{seq}"
-    while tid in DEALS:  # safety, collision na ho
+    tid = f"{TRADE_PREFIX}-{seq}"
+    while tid in DEALS:
         seq += 1
-        tid = f"DL-RIZZLER-{seq}"
+        tid = f"{TRADE_PREFIX}-{seq}"
     return tid
 
 
@@ -886,6 +888,71 @@ async def _legacy_mystatus_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 # ===========================
+# OWNER CLOSE IMAGE
+# ===========================
+
+CLOSE_IMAGE_META_ID = "owner_close_image"
+
+def get_close_image_id():
+    """Return the owner-selected Telegram photo file_id, if configured."""
+    if meta_coll is None:
+        return None
+    try:
+        doc = meta_coll.find_one({"_id": CLOSE_IMAGE_META_ID})
+        return doc.get("file_id") if doc else None
+    except Exception:
+        return None
+
+
+async def setcloseimage_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Owner-only: set the payment/deal close image used on completed deals."""
+    if not update.effective_user or not is_owner(update.effective_user.id):
+        return
+
+    message = update.message
+    photo = None
+
+    if message and message.photo:
+        photo = message.photo[-1]
+    elif message and message.reply_to_message and message.reply_to_message.photo:
+        photo = message.reply_to_message.photo[-1]
+
+    if not photo:
+        await message.reply_text(
+            "❌ Owner ko photo ke saath /setcloseimage bhejna hai, "
+            "ya photo par reply karke /setcloseimage bhejo."
+        )
+        return
+
+    if meta_coll is None:
+        await message.reply_text("❌ MongoDB required hai close image save karne ke liye.")
+        return
+
+    meta_coll.update_one(
+        {"_id": CLOSE_IMAGE_META_ID},
+        {"$set": {
+            "file_id": photo.file_id,
+            "updated_by": update.effective_user.id,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }},
+        upsert=True,
+    )
+
+    await message.reply_text("✅ Owner close image set ho gayi. Ab completed deal isi image ke saath send hogi.")
+
+
+async def removecloseimage_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Owner-only: remove the custom close image."""
+    if not update.effective_user or not is_owner(update.effective_user.id):
+        return
+
+    if meta_coll is not None:
+        meta_coll.delete_one({"_id": CLOSE_IMAGE_META_ID})
+
+    await update.message.reply_text("✅ Owner close image remove kar di gayi.")
+
+
+# ===========================
 # /add
 # ===========================
 
@@ -1093,206 +1160,163 @@ async def hold_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ===========================
 
 async def close(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    allowed, reason = await add_close_allowed(update, context)
+    """
+    Close a deal only from a reply to the deal message.
 
+    SECURITY RULE: a payment screenshot/photo MUST be attached to the
+    /close command. Without the screenshot the deal is never closed.
+    """
+    allowed, reason = await add_close_allowed(update, context)
     if not allowed:
         if reason and update.message:
             await update.message.reply_text(reason)
         return
 
-    tid = None
-    released_amount_arg = None
+    message = update.message
+    if not message:
+        return
 
-    # ==========================================
-    # CASE 1: Direct ID
-    #
-    # /close DL-RIZZLER-4
-    # /close DL-RIZZLER-4 300
-    # /close DL-RIZZLER-4 cancel
-    # ==========================================
-    if context.args and re.fullmatch(
-        r"DL-RIZZLER-\d+",
-        context.args[0],
-        re.IGNORECASE
-    ):
-        tid = context.args[0].upper()
-
-        if len(context.args) > 1:
-            released_amount_arg = context.args[1]
-
-    # ==========================================
-    # CASE 2: Reply karke
-    #
-    # /close
-    # /close 300
-    # /close cancel
-    # ==========================================
-    elif update.message.reply_to_message:
-        reply_text = update.message.reply_to_message.text or ""
-
-        match = re.search(
-            r"Trade ID:\s*(DL-RIZZLER-\d+)",
-            reply_text,
-            re.IGNORECASE
-        )
-
-        if not match:
-            await update.message.reply_text(
-                "❌ Reply kiye gaye message me Trade ID nahi mila."
-            )
-            return
-
-        tid = match.group(1).upper()
-
-        if context.args:
-            released_amount_arg = context.args[0]
-
-    # ==========================================
-    # Invalid usage
-    # ==========================================
-    else:
-        await update.message.reply_text(
-            "❌ Deal close karne ke liye:\n\n"
-            "<b>Reply karke:</b>\n"
-            "<code>/close</code>\n"
-            "<code>/close 300</code>\n"
-            "<code>/close cancel</code>\n\n"
-            "<b>Ya direct ID se:</b>\n"
-            "<code>/close DL-RIZZLER-4</code>\n"
-            "<code>/close DL-RIZZLER-4 300</code>\n"
-            "<code>/close DL-RIZZLER-4 cancel</code>",
-            parse_mode=ParseMode.HTML,
+    # /close must be a reply to the original deal message.
+    if not message.reply_to_message:
+        await message.reply_text(
+            "❌ /close ko original deal message par reply karke bhejo.\n\n"
+            "📸 Payment screenshot bhi isi /close message ke saath attach hona compulsory hai."
         )
         return
 
-    # ==========================================
-    # Deal lookup
-    # ==========================================
-    deal = DEALS.get(tid)
+    # Payment proof is mandatory. Only Telegram photo/screenshot is accepted.
+    if not message.photo:
+        await message.reply_text(
+            "❌ Payment screenshot required hai.\n\n"
+            "📸 Original deal par reply karo + payment screenshot attach karo + caption me /close likho.\n"
+            "Screenshot ke bina deal close nahi hogi."
+        )
+        return
 
+    reply_text = message.reply_to_message.text or message.reply_to_message.caption or ""
+
+    # Support both old stored deals and the new DL-BLAZE format.
+    match = re.search(
+        r"Trade ID\s*:</?[^>]*>\s*(?:<code>)?((?:DL-BLAZE|DL-RIZZLER)-\d+)",
+        reply_text,
+        re.IGNORECASE,
+    )
+    if not match:
+        match = re.search(
+            r"Trade ID\s*:\s*(DL-(?:BLAZE|RIZZLER)-\d+)",
+            reply_text,
+            re.IGNORECASE,
+        )
+
+    if not match:
+        await message.reply_text(
+            "❌ Reply kiye gaye message me valid Trade ID nahi mila."
+        )
+        return
+
+    tid = match.group(1).upper()
+
+    # Optional release amount / cancel is allowed after /close, but screenshot
+    # remains mandatory in every case.
+    released_amount_arg = context.args[0] if context.args else None
+
+    deal = DEALS.get(tid)
     if not deal:
-        await update.message.reply_text(
+        await message.reply_text(
             f"❌ Deal <code>{esc(tid)}</code> not found.",
             parse_mode=ParseMode.HTML,
         )
         return
 
-    # ==========================================
-    # CLOSE PERMISSION CHECK
-    #
-    # Owner -> kisi ki bhi deal close kar sakta hai
-    # Admin -> sirf apni create ki hui deal close kar sakta hai
-    # ==========================================
     closer_id = update.effective_user.id
     deal_creator_id = deal.get("created_by_id")
 
+    # Owner -> any deal. Admin -> only own deal.
     if not is_owner(closer_id):
-
-        # New deals:
-        # Telegram user ID exact match
         if deal_creator_id is not None:
-
             if closer_id != deal_creator_id:
-                await update.message.reply_text(
+                await message.reply_text(
                     "❌ Tum sirf apni create ki hui deal close kar sakte ho."
                 )
                 return
+        elif resolve_username(update) != deal.get("escrowed_by"):
+            await message.reply_text(
+                "❌ Tum sirf apni create ki hui deal close kar sakte ho."
+            )
+            return
 
-        # Old deals:
-        # created_by_id nahi hai to username fallback
-        else:
-
-            if resolve_username(update) != deal.get("escrowed_by"):
-                await update.message.reply_text(
-                    "❌ Tum sirf apni create ki hui deal close kar sakte ho."
-                )
-                return
-
-    # ==========================================
-    # Status check
-    # ==========================================
     if deal.get("status") == "HOLD":
-        await update.message.reply_text(
-            "⏸️ Yeh deal HOLD par hai. Pehle /unhold karo."
-        )
+        await message.reply_text("⏸️ Yeh deal HOLD par hai. Pehle /unhold karo.")
         return
 
     if deal.get("status") != "ACTIVE":
-        await update.message.reply_text(
+        await message.reply_text(
             f"❌ Yeh deal already {deal.get('status', 'closed')} hai."
         )
         return
 
-    # ==========================================
-    # Cancel / Complete
-    # ==========================================
-    is_cancel = (
-        released_amount_arg
-        and released_amount_arg.lower() == "cancel"
-    )
-
+    is_cancel = bool(released_amount_arg and released_amount_arg.lower() == "cancel")
     currency_val = deal.get("currency", "INR")
 
     if is_cancel:
         released_val = 0.0
-
     elif released_amount_arg:
         released_val = extract_amount(released_amount_arg)
-
     else:
         released_val = deal.get("release", 0.0)
 
-    # ==========================================
-    # Update deal
-    # ==========================================
+    # Save payment proof file_id permanently with the deal.
+    payment_photo = message.photo[-1]
+    deal["payment_proof_file_id"] = payment_photo.file_id
+    deal["payment_proof_unique_id"] = getattr(payment_photo, "file_unique_id", None)
+    deal["payment_proof_uploaded_by_id"] = closer_id
+    deal["payment_proof_uploaded_at"] = datetime.now(timezone.utc).isoformat()
+
     deal["status"] = "CANCELLED" if is_cancel else "COMPLETED"
     deal["released"] = released_val
     deal["completed_at"] = datetime.now(timezone.utc).isoformat()
-
-    # Optional: actual kisne close kiya record karo
     deal["closed_by_id"] = closer_id
     deal["closed_by"] = resolve_username(update)
-
     save_deal(tid)
 
-    closer = resolve_username(update)
-
-    # ==========================================
-    # Cancel message
-    # ==========================================
     if is_cancel:
-
         msg = (
             f"❌ <b>Deal Cancelled</b>\n"
             f"{pe('🆔')} Trade ID: <code>{esc(tid)}</code>\n"
             f"{pe('ℹ️')} 100% of the charge has been deducted.\n"
             f"{pe('🛡️')} Escrowed By: {esc(deal.get('escrowed_by', '-'))}"
         )
-
-    # ==========================================
-    # Completed message
-    # ==========================================
     else:
-
         msg = (
             f"{pe('✅')} <b>Deal Completed</b>\n"
             f"{pe('🆔')} Trade ID: <code>{esc(tid)}</code>\n"
             f"{pe('📤')} Released: {fmt(released_val, currency_val)}\n"
             f"{pe('🛡️')} Escrowed By: {esc(deal.get('escrowed_by', '-'))}\n\n"
-            f"~ {esc(deal['buyer'])} and {esc(deal['seller'])} are requested to "
+            f"~ {esc(deal.get('buyer', '-'))} and {esc(deal.get('seller', '-'))} are requested to "
             f"drop the vouch before leaving👇🏻\n\n"
-            f"<code>Vouch @rizzlerxescrow for "
+            f"<code>Vouch @BLAZEXESCROWSERVICE for "
             f"{fmt(released_val, currency_val)} smooth escrow deal</code>\n"
         )
 
-    await update.message.reply_text(
-        msg,
-        parse_mode=ParseMode.HTML
-    )
+    # Owner-selected image is immutable to admins and is only configurable by owner.
+    close_image_id = get_close_image_id()
+    if close_image_id and not is_cancel:
+        try:
+            await context.bot.send_photo(
+                chat_id=message.chat_id,
+                photo=close_image_id,
+                caption=msg,
+                parse_mode=ParseMode.HTML,
+            )
+        except (BadRequest, TelegramError):
+            # If Telegram rejects the stored file_id, fall back to text and keep
+            # the deal closed rather than failing the whole close operation.
+            await message.reply_text(msg, parse_mode=ParseMode.HTML)
+    else:
+        await message.reply_text(msg, parse_mode=ParseMode.HTML)
 
-    # Command message delete
     try:
-        await update.message.delete()
+        await message.delete()
     except Exception:
         pass
 
@@ -1349,12 +1373,12 @@ async def leaderboard_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def deal_lookup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/deal DL-RIZZLER-5 -> admin kisi bhi deal ki full detail (escrowed_by samet) dekh sakta hai."""
+    """/deal DL-BLAZE-5 -> admin kisi bhi deal ki full detail (escrowed_by samet) dekh sakta hai."""
     if not admin_only_allowed(update):
         return
 
     if not context.args:
-        await update.message.reply_text("Usage: <code>/deal DL-RIZZLER-5</code>", parse_mode=ParseMode.HTML)
+        await update.message.reply_text("Usage: <code>/deal DL-BLAZE-5</code>", parse_mode=ParseMode.HTML)
         return
 
     tid = context.args[0].upper()
@@ -2659,10 +2683,10 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "",
             "<b>🛡 Admin Commands</b> (private chat me hi kaam karenge)",
             "/add — Deal create karo (deal message pe reply karke)",
-            "/close — Deal complete karo (deal message pe reply karke)",
+            "/close — Payment screenshot ke saath deal complete karo (deal message par reply)",
             "/alldeals — Saari deals ki poori list",
             "/leaderboard — Today + All-time top dealer/earner",
-            "/deal &lt;DL-RIZZLER-N&gt; — Kisi bhi deal ki full detail dekho",
+            "/deal &lt;DL-BLAZE-N&gt; — Kisi bhi deal ki full detail dekho",
             "/admins — Bot admins ki list dekho",
             "/groups — Bot kin groups me added hai + authorization control",
             "/groupaccess &lt;group_id&gt; — Bot ke Telegram permissions dekho",
@@ -2676,6 +2700,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "<b>👑 Owner Commands</b>",
             "/addadmin — Reply karke (ya ID de ke) naya bot admin banao",
             "/removeadmin — Reply karke (ya ID de ke) admin hatao",
+            "/setcloseimage — Apni close image set karo (Owner-only, photo ke saath)",
+            "/removecloseimage — Close image remove karo (Owner-only)",
         ]
 
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
@@ -2690,7 +2716,7 @@ def start_dummy_server():
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
-            body = b"RizzlerXEscrow bot is running"
+            body = b"blazexescrow bot is running"
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
@@ -2763,6 +2789,8 @@ def main():
     app.add_handler(CommandHandler("del", del_cmd))
     app.add_handler(CommandHandler("add", add))
     app.add_handler(CommandHandler("close", close))
+    app.add_handler(CommandHandler("setcloseimage", setcloseimage_cmd))
+    app.add_handler(CommandHandler("removecloseimage", removecloseimage_cmd))
     app.add_handler(CommandHandler("hold", hold_cmd))
     app.add_handler(CommandHandler("broadcast", broadcast_cmd))
     app.add_handler(CommandHandler("alldeals", alldeals_cmd))
@@ -2820,7 +2848,7 @@ def main():
     app.add_handler(CallbackQueryHandler(callback_router))
     app.add_error_handler(global_error_handler)
 
-    log_event("BOOT", "RizzlerXEscrow Bot starting polling")
+    log_event("BOOT", "blazexescrow Bot starting polling")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
