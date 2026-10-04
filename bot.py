@@ -79,8 +79,8 @@ def log_event(scope, message, level=logging.INFO, *args):
 # ADMIN_IDS=123,456   -> ye "OWNERS" hai, sirf ye naye bot-admin add/remove kar sakte hai
 
 BOT_TOKEN = os.getenv("BLAZE_BOT_TOKEN")
-BRAND = "BLAZEXESCROWSERVICE"
-PROVIDER = "BLAZEXESCROWSERVICE"
+BRAND = "@BLAZEXESCROWSERVICE"
+PROVIDER = "@BLAZEXESCROWSERVICE"
 TRADE_PREFIX = "DL-BLAZE"  # New deals: DL-BLAZE-1, DL-BLAZE-2, ...
 
 MONGO_URI = os.getenv("MONGO_URI")
